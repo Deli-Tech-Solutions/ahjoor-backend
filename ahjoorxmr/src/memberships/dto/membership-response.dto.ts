@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { MembershipStatus } from '../entities/membership-status.enum';
 
 /**
@@ -56,6 +56,16 @@ export class MembershipResponseDto {
   })
   transactionHash?: string | null;
   status: MembershipStatus;
+
+  @ApiPropertyOptional({
+    description:
+      'Cross-group trust score in the range [0, 100]. Null until the first nightly calculation has run.',
+    example: 72.5,
+    nullable: true,
+    minimum: 0,
+    maximum: 100,
+  })
+  trustScore?: number | null;
 
   @ApiProperty({
     description: 'Membership creation timestamp (ISO 8601)',

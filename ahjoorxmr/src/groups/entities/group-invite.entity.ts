@@ -10,6 +10,7 @@ export enum InviteStatus {
 }
 
 @Entity('group_invites')
+@Index(['status', 'expiresAt'])
 export class GroupInvite extends BaseEntity {
   @Column({ type: 'uuid' })
   groupId: string;

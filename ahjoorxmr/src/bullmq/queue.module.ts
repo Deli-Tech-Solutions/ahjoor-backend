@@ -18,6 +18,7 @@ import { EventSyncProcessor } from './event-sync.processor';
 import { GroupSyncProcessor } from './group-sync.processor';
 import { PayoutReconciliationProcessor } from './payout-reconciliation.processor';
 import { TxConfirmationProcessor } from './tx-confirmation.processor';
+import { PushNotificationProcessor } from './push-notification.processor';
 import { JobFailureService } from './job-failure.service';
 import { JobFailuresAdminController } from './job-failures-admin.controller';
 import { JobFailure } from './entities/job-failure.entity';
@@ -109,6 +110,8 @@ const bullBoardAuthMiddleware = (req: Request, res: Response, next: NextFunction
         name: QUEUE_NAMES.DEAD_LETTER,
         defaultJobOptions: { removeOnComplete: false, removeOnFail: false },
       },
+      { name: QUEUE_NAMES.PUSH_NOTIFICATION, ...sharedQueueOptions },
+      { name: QUEUE_NAMES.TRUST_SCORE, ...sharedQueueOptions },
     ),
 
     // Integrate BullBoard
@@ -124,6 +127,8 @@ const bullBoardAuthMiddleware = (req: Request, res: Response, next: NextFunction
       { name: QUEUE_NAMES.PAYOUT_RECONCILIATION, adapter: BullMQAdapter },
       { name: QUEUE_NAMES.TX_CONFIRMATION, adapter: BullMQAdapter },
       { name: QUEUE_NAMES.DEAD_LETTER, adapter: BullMQAdapter },
+      { name: QUEUE_NAMES.PUSH_NOTIFICATION, adapter: BullMQAdapter },
+      { name: QUEUE_NAMES.TRUST_SCORE, adapter: BullMQAdapter },
     ),
   ],
   controllers: [QueueAdminController, JobFailuresAdminController],
@@ -135,6 +140,7 @@ const bullBoardAuthMiddleware = (req: Request, res: Response, next: NextFunction
     GroupSyncProcessor,
     PayoutReconciliationProcessor,
     TxConfirmationProcessor,
+    PushNotificationProcessor,
     JobFailureService,
   ],
   exports: [
@@ -154,6 +160,7 @@ export class QueueModule implements OnModuleInit {
     @InjectQueue(QUEUE_NAMES.GROUP_SYNC) private readonly groupSyncQueue: Queue,
     @InjectQueue(QUEUE_NAMES.PAYOUT_RECONCILIATION) private readonly payoutQueue: Queue,
     @InjectQueue(QUEUE_NAMES.TX_CONFIRMATION) private readonly txConfirmationQueue: Queue,
+    @InjectQueue(QUEUE_NAMES.PUSH_NOTIFICATION) private readonly pushNotificationQueue: Queue,
   ) {}
 
   onModuleInit() {
@@ -163,6 +170,7 @@ export class QueueModule implements OnModuleInit {
       this.groupSyncQueue,
       this.payoutQueue,
       this.txConfirmationQueue,
+      this.pushNotificationQueue,
     ];
 
     for (const queue of queues) {

@@ -186,6 +186,68 @@ export class ContributionsService {
             'ContributionsService',
           );
         }
+
+        // Verify contribution amount and asset match group requirements
+        try {
+          const txDetails = await this.stellarService.getTransactionAmount(transactionHash);
+          const requiredAmount = group.contributionAmount;
+          const requiredAsset = (group.assetCode ?? 'XLM').toUpperCase();
+          const txAsset = txDetails.assetCode.toUpperCase();
+
+          // Check asset matches
+          if (txAsset !== requiredAsset) {
+            this.logger.warn(
+              `Asset mismatch for transaction ${transactionHash}: expected ${requiredAsset}, got ${txAsset}`,
+              'ContributionsService',
+            );
+            throw new BadRequestException(
+              `Transaction asset (${txAsset}) does not match group required asset (${requiredAsset})`,
+            );
+          }
+
+          // Check amount meets requirement
+          const txAmountNum = Number(txDetails.amount);
+          const requiredAmountNum = Number(requiredAmount);
+
+          if (isNaN(txAmountNum) || isNaN(requiredAmountNum)) {
+            this.logger.warn(
+              `Invalid amount format: txAmount=${txDetails.amount}, requiredAmount=${requiredAmount}`,
+              'ContributionsService',
+            );
+            throw new BadRequestException(
+              'Unable to parse transaction amount for verification',
+            );
+          }
+
+          if (txAmountNum < requiredAmountNum) {
+            this.logger.warn(
+              `Amount insufficient for transaction ${transactionHash}: required ${requiredAmount}, got ${txDetails.amount}`,
+              'ContributionsService',
+            );
+            throw new BadRequestException(
+              `Transaction amount (${txDetails.amount}) is less than required contribution amount (${requiredAmount})`,
+            );
+          }
+
+          this.logger.log(
+            `Amount verification passed for transaction ${transactionHash}: ${txDetails.amount} ${txAsset} meets requirement of ${requiredAmount} ${requiredAsset}`,
+            'ContributionsService',
+          );
+        } catch (amountError) {
+          // If it's already a BadRequestException, re-throw it
+          if (amountError instanceof BadRequestException) {
+            throw amountError;
+          }
+          // Log other errors but don't block contribution (conservative approach)
+          this.logger.error(
+            `Failed to verify transaction amount for ${transactionHash}: ${(amountError as Error).message}`,
+            (amountError as Error).stack,
+            'ContributionsService',
+          );
+          throw new BadRequestException(
+            `Failed to verify transaction amount: ${(amountError as Error).message}`,
+          );
+        }
       }
 
       const insertResult = await this.contributionRepository

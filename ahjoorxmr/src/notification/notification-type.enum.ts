@@ -15,4 +15,5 @@ export enum NotificationType {
   MEMBER_REINSTATED = 'member_reinstated',
   GROUP_ANNOUNCEMENT = 'group_announcement',
   IMPERSONATION_REQUEST = 'impersonation_request',
+  WAITLIST_ADMITTED = 'waitlist_admitted',
 }

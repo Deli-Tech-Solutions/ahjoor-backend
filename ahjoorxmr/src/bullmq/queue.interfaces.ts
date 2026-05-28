@@ -78,6 +78,17 @@ export interface ReconcilePayoutJobData {
 }
 
 // ---------------------------------------------------------------------------
+// Push Notification Queue Job Data
+// ---------------------------------------------------------------------------
+export interface SendPushNotificationJobData {
+  userId: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+  notificationType: string;
+}
+
+// ---------------------------------------------------------------------------
 // Dead-letter Queue Job Data
 // ---------------------------------------------------------------------------
 export interface DeadLetterJobData {
@@ -89,4 +100,14 @@ export interface DeadLetterJobData {
   failedAt: string;
   attemptsMade: number;
   stackTrace?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Trust Score Queue Job Data
+// ---------------------------------------------------------------------------
+export interface RecalculateTrustScoresJobData {
+  /** Optional subset of user IDs to recalculate. If omitted, all users are processed. */
+  userIds?: string[];
+  /** ISO timestamp when the job was enqueued (for audit/logging). */
+  enqueuedAt: string;
 }

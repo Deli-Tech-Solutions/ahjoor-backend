@@ -173,6 +173,59 @@
         ]
       }
     },
+    "/v1/groups/{id}/waitlist": {
+      "post": {
+        "operationId": "WaitlistController_joinWaitlist",
+        "summary": "Join the group waitlist",
+        "tags": ["Waitlist"],
+        "security": [{"JWT-auth": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"type": "object", "required": ["walletAddress"], "properties": {"walletAddress": {"type": "string"}}}}}
+        },
+        "responses": {
+          "201": {"description": "Joined waitlist", "content": {"application/json": {"schema": {"type": "object", "properties": {"position": {"type": "number"}}}}}},
+          "400": {"description": "Group not full or waitlist cap reached"},
+          "409": {"description": "Already a member or already on waitlist"}
+        }
+      },
+      "delete": {
+        "operationId": "WaitlistController_leaveWaitlist",
+        "summary": "Leave the group waitlist",
+        "tags": ["Waitlist"],
+        "security": [{"JWT-auth": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "responses": {
+          "204": {"description": "Left waitlist"},
+          "404": {"description": "Waitlist entry not found"}
+        }
+      },
+      "get": {
+        "operationId": "WaitlistController_getWaitlist",
+        "summary": "Get ordered waitlist (group admin only)",
+        "tags": ["Waitlist"],
+        "security": [{"JWT-auth": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "responses": {
+          "200": {"description": "Ordered waitlist with user details"},
+          "403": {"description": "Not the group admin"}
+        }
+      }
+    },
+    "/v1/groups/{id}/waitlist/me": {
+      "get": {
+        "operationId": "WaitlistController_getMyPosition",
+        "summary": "Get your own waitlist position",
+        "tags": ["Waitlist"],
+        "security": [{"JWT-auth": []}],
+        "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+        "responses": {
+          "200": {"description": "Your current waitlist position and status", "content": {"application/json": {"schema": {"type": "object", "properties": {"position": {"type": "number"}, "status": {"type": "string", "enum": ["WAITING", "ADMITTED", "CANCELLED"]}}}}}},
+          "404": {"description": "No waitlist entry found"}
+        }
+      }
+    },
     "/users": {
       "get": {
         "description": "Returns a paginated list of users with optional filtering and sorting. Requires authentication.",

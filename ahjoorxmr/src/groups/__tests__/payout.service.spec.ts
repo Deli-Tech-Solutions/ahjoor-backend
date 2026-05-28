@@ -16,6 +16,7 @@ import { PayoutTransaction } from '../entities/payout-transaction.entity';
 import { QueueService } from '../../bullmq/queue.service';
 import { ConfigService } from '@nestjs/config';
 import { PayoutTransactionStatus } from '../entities/payout-transaction-status.enum';
+import { Penalty } from '../../penalties/entities/penalty.entity';
 
 describe('PayoutService', () => {
   let service: PayoutService;
@@ -26,6 +27,7 @@ describe('PayoutService', () => {
     create: jest.Mock;
     save: jest.Mock;
   };
+  let penaltyRepo: { count: jest.Mock };
   let stellarService: { disbursePayout: jest.Mock };
   let notificationsService: { notify: jest.Mock };
   let queueService: { addPayoutReconciliation: jest.Mock };
@@ -45,6 +47,7 @@ describe('PayoutService', () => {
       create: jest.fn(),
       save: jest.fn(),
     };
+    penaltyRepo = { count: jest.fn().mockResolvedValue(0) };
     stellarService = { disbursePayout: jest.fn() };
     notificationsService = { notify: jest.fn().mockResolvedValue(undefined) };
     queueService = {
@@ -61,6 +64,7 @@ describe('PayoutService', () => {
           provide: getRepositoryToken(PayoutTransaction),
           useValue: payoutTransactionRepo,
         },
+        { provide: getRepositoryToken(Penalty), useValue: penaltyRepo },
         { provide: StellarService, useValue: stellarService },
         { provide: NotificationsService, useValue: notificationsService },
         { provide: QueueService, useValue: queueService },
@@ -310,5 +314,65 @@ describe('PayoutService', () => {
     expect(queueService.addPayoutReconciliation).toHaveBeenCalledWith({
       payoutTransactionId: 'ptx-crash',
     });
+  });
+
+  it('should throw BadRequestException and emit notification when recipient has outstanding penalties', async () => {
+    groupRepo.findOne.mockResolvedValue({
+      id: GROUP_ID,
+      status: GroupStatus.ACTIVE,
+      contractAddress: CONTRACT_ADDRESS,
+      contributionAmount: CONTRIBUTION_AMOUNT,
+      name: 'Test Group',
+    } as Group);
+    membershipRepo.findOne.mockResolvedValue({
+      userId: USER_ID,
+      walletAddress: WALLET_ADDRESS,
+      hasReceivedPayout: false,
+    } as Membership);
+    penaltyRepo.count.mockResolvedValue(2);
+
+    await expect(service.distributePayout(GROUP_ID, 1)).rejects.toThrow(
+      BadRequestException,
+    );
+    expect(stellarService.disbursePayout).not.toHaveBeenCalled();
+    expect(notificationsService.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'payout_blocked_pending_penalty' }),
+    );
+  });
+
+  it('should proceed with payout when recipient has no outstanding penalties', async () => {
+    const txHash = 'TX_CLEAR_123';
+    groupRepo.findOne.mockResolvedValue({
+      id: GROUP_ID,
+      status: GroupStatus.ACTIVE,
+      contractAddress: CONTRACT_ADDRESS,
+      contributionAmount: CONTRIBUTION_AMOUNT,
+      name: 'Test Group',
+    } as Group);
+    membershipRepo.findOne.mockResolvedValue({
+      userId: USER_ID,
+      walletAddress: WALLET_ADDRESS,
+      hasReceivedPayout: false,
+    } as Membership);
+    penaltyRepo.count.mockResolvedValue(0);
+    payoutTransactionRepo.findOne.mockResolvedValue(null);
+    payoutTransactionRepo.create.mockReturnValue({
+      id: 'ptx-clear',
+      payoutOrderId: `${GROUP_ID}:1`,
+      status: PayoutTransactionStatus.PENDING_SUBMISSION,
+      txHash: null,
+    });
+    payoutTransactionRepo.save.mockResolvedValue({
+      id: 'ptx-clear',
+      status: PayoutTransactionStatus.SUBMITTED,
+      txHash,
+    });
+    stellarService.disbursePayout.mockResolvedValue(txHash);
+    membershipRepo.save.mockResolvedValue({});
+
+    const result = await service.distributePayout(GROUP_ID, 1);
+
+    expect(result).toBe(txHash);
+    expect(stellarService.disbursePayout).toHaveBeenCalled();
   });
 });

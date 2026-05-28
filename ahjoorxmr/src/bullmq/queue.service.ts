@@ -12,6 +12,8 @@ import {
   SyncGroupStateJobData,
   SyncAllGroupsJobData,
   ReconcilePayoutJobData,
+  SendPushNotificationJobData,
+  RecalculateTrustScoresJobData,
 } from './queue.interfaces';
 import { TxConfirmationJobData } from './tx-confirmation.processor';
 import { injectTraceContext } from '../common/tracing/stellar-tracing';
@@ -66,6 +68,10 @@ export class QueueService {
     private readonly deadLetterQueue: Queue,
     @InjectQueue(QUEUE_NAMES.TX_CONFIRMATION)
     private readonly txConfirmationQueue: Queue,
+    @InjectQueue(QUEUE_NAMES.PUSH_NOTIFICATION)
+    private readonly pushNotificationQueue: Queue,
+    @InjectQueue(QUEUE_NAMES.TRUST_SCORE)
+    private readonly trustScoreQueue: Queue,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -243,7 +249,40 @@ export class QueueService {
       this.payoutReconciliationQueue,
       this.deadLetterQueue,
       this.txConfirmationQueue,
+      this.pushNotificationQueue,
     ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Push notification queue helpers
+  // ---------------------------------------------------------------------------
+  async addSendPushNotification(
+    data: SendPushNotificationJobData,
+    opts?: Partial<JobsOptions>,
+  ) {
+    return this.pushNotificationQueue.add(
+      JOB_NAMES.SEND_PUSH,
+      withTraceContext(data),
+      defaultJobOptions(opts),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Trust score queue helpers
+  // ---------------------------------------------------------------------------
+  async addRecalculateTrustScores(
+    data: RecalculateTrustScoresJobData,
+    opts?: Partial<JobsOptions>,
+  ) {
+    return this.trustScoreQueue.add(
+      JOB_NAMES.RECALCULATE_TRUST_SCORES,
+      data,
+      defaultJobOptions({
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 10_000 },
+        ...opts,
+      }),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -289,6 +328,12 @@ export class QueueService {
         break;
       case QUEUE_NAMES.PAYOUT_RECONCILIATION:
         targetQueue = this.payoutReconciliationQueue;
+        break;
+      case QUEUE_NAMES.TX_CONFIRMATION:
+        targetQueue = this.txConfirmationQueue;
+        break;
+      case QUEUE_NAMES.PUSH_NOTIFICATION:
+        targetQueue = this.pushNotificationQueue;
         break;
       default:
         throw new Error(`Unknown queue: ${originalQueue}`);

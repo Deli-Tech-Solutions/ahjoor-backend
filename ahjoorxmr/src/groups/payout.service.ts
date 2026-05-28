@@ -10,7 +10,7 @@ import { OnApplicationBootstrap } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Group } from '../groups/entities/group.entity';
 import { Membership } from '../memberships/entities/membership.entity';
 import { GroupStatus } from '../groups/entities/group-status.enum';
@@ -20,6 +20,7 @@ import { NotificationType } from '../notification/notification-type.enum';
 import { PayoutTransaction } from './entities/payout-transaction.entity';
 import { PayoutTransactionStatus } from './entities/payout-transaction-status.enum';
 import { QueueService } from '../bullmq/queue.service';
+import { Penalty, PenaltyStatus } from '../penalties/entities/penalty.entity';
 
 @Injectable()
 export class PayoutService implements OnApplicationBootstrap {
@@ -32,6 +33,8 @@ export class PayoutService implements OnApplicationBootstrap {
     private readonly membershipRepository: Repository<Membership>,
     @InjectRepository(PayoutTransaction)
     private readonly payoutTransactionRepository: Repository<PayoutTransaction>,
+    @InjectRepository(Penalty)
+    private readonly penaltyRepository: Repository<Penalty>,
     private readonly stellarService: StellarService,
     private readonly notificationsService: NotificationsService,
     private readonly queueService: QueueService,
@@ -85,6 +88,30 @@ export class PayoutService implements OnApplicationBootstrap {
         `Member ${recipient.userId} has already received payout for group ${groupId}`,
       );
       throw new ConflictException('Member has already received payout');
+    }
+
+    const outstandingPenalties = await this.penaltyRepository.count({
+      where: {
+        userId: recipient.userId,
+        groupId,
+        status: In([PenaltyStatus.PENDING]),
+      },
+    });
+
+    if (outstandingPenalties > 0) {
+      this.logger.warn(
+        `Payout blocked for user ${recipient.userId} in group ${groupId}: ${outstandingPenalties} outstanding penalty(ies)`,
+      );
+      await this.notificationsService.notify({
+        userId: recipient.userId,
+        type: NotificationType.PAYOUT_BLOCKED_PENDING_PENALTY,
+        title: 'Payout Blocked',
+        body: `Your payout for group "${group.name}" is blocked due to ${outstandingPenalties} outstanding penalty(ies). Please settle them first.`,
+        metadata: { groupId, round, outstandingPenalties },
+      });
+      throw new BadRequestException(
+        `Payout blocked: recipient has ${outstandingPenalties} outstanding penalty(ies) in this group`,
+      );
     }
 
     this.logger.log(

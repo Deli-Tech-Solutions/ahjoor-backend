@@ -585,6 +585,206 @@ export class StellarService {
   }
 
   /**
+   * Retrieves the contribution amount and asset from a transaction.
+   * Parses the transaction envelope to extract the amount parameter from a 'contribute' call.
+   *
+   * @param txHash - The transaction hash to inspect
+   * @returns Object containing amount (as string), assetCode, and assetIssuer (null for XLM)
+   * @throws BadRequestException if transaction hash is missing
+   * @throws BadRequestException if transaction is not a valid contribution call
+   * @throws BadGatewayException if RPC communication fails
+   */
+  async getTransactionAmount(
+    txHash: string,
+  ): Promise<{ amount: string; assetCode: string; assetIssuer: string | null }> {
+    if (!txHash) {
+      throw new BadRequestException('Transaction hash is required');
+    }
+
+    this.validateConfiguration();
+    try {
+      const transaction = await this.withFailover(
+        (s) => s.getTransaction(txHash),
+        'getTransaction',
+      );
+      if (!transaction) {
+        throw new BadRequestException('Transaction not found on-chain');
+      }
+
+      const status = String(
+        transaction.status ?? transaction.txStatus ?? '',
+      ).toLowerCase();
+      if (status && status !== 'success') {
+        throw new BadRequestException(`Transaction status is not success: ${status}`);
+      }
+
+      return this.extractContributionAmount(transaction);
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      throw this.mapRpcError('Unable to fetch transaction amount', error);
+    }
+  }
+
+  /**
+   * Extracts contribution amount and asset from a transaction envelope.
+   * Looks for 'contribute' function calls and extracts the amount parameter.
+   *
+   * @param transaction - The transaction object from Stellar RPC
+   * @returns Object containing amount, assetCode, and assetIssuer
+   * @throws BadRequestException if unable to extract amount
+   * @private
+   */
+  private extractContributionAmount(
+    transaction: any,
+  ): { amount: string; assetCode: string; assetIssuer: string | null } {
+    // Try direct transaction fields first
+    const directAmount =
+      transaction.amount ??
+      transaction.paymentAmount ??
+      transaction.contributionAmount;
+    if (directAmount && typeof directAmount === 'string') {
+      const assetCode = transaction.assetCode ?? transaction.asset ?? 'XLM';
+      const assetIssuer = transaction.assetIssuer ?? null;
+      return { amount: directAmount, assetCode, assetIssuer };
+    }
+
+    // Parse envelope XDR to extract amount from function arguments
+    const envelopeXdr =
+      transaction.envelopeXdr ??
+      transaction.envelope_xdr ??
+      transaction.envelope;
+    if (!envelopeXdr || typeof envelopeXdr !== 'string') {
+      throw new BadRequestException('Transaction envelope not available');
+    }
+
+    try {
+      const envelope = (StellarSdk as any).xdr.TransactionEnvelope.fromXDR(
+        envelopeXdr,
+        'base64',
+      );
+      const txContainer =
+        (typeof envelope.v1 === 'function' && envelope.v1()?.tx?.()) ||
+        (typeof envelope.tx === 'function' && envelope.tx()) ||
+        null;
+      const operations = txContainer?.operations?.() ?? [];
+
+      for (const operation of operations) {
+        const body = operation.body?.();
+        const invokeOp = body?.invokeHostFunctionOp?.();
+        const hostFunction = invokeOp?.hostFunction?.();
+        const invokeContract = hostFunction?.invokeContract?.();
+
+        if (!invokeContract) {
+          continue;
+        }
+
+        const functionName = this.readFunctionName(invokeContract);
+        if (functionName !== 'contribute') {
+          continue;
+        }
+
+        // Extract amount from function arguments (typically the first argument after function name)
+        const args = invokeContract.args?.() ?? [];
+        // Look for the amount argument - usually an I128 or U128 SCVal
+        for (const arg of args) {
+          const amount = this.readScValAsString(arg);
+          if (amount && !isNaN(Number(amount))) {
+            // Try to determine asset from transaction meta or default to XLM
+            // In Soroban contracts, asset is often passed as a separate argument
+            let assetCode = 'XLM';
+            let assetIssuer: string | null = null;
+
+            // Check for asset in other arguments
+            for (const otherArg of args) {
+              if (otherArg === arg) continue;
+              const assetStr = this.readScValAsString(otherArg);
+              if (assetStr && (assetStr.length <= 12 || assetStr.includes(':'))) {
+                // Could be an asset identifier
+                if (assetStr.includes(':')) {
+                  const [code, issuer] = assetStr.split(':');
+                  assetCode = code;
+                  assetIssuer = issuer;
+                } else if (assetStr !== amount) {
+                  assetCode = assetStr.toUpperCase();
+                }
+              }
+            }
+
+            return { amount, assetCode, assetIssuer };
+          }
+        }
+      }
+    } catch (parseError) {
+      throw new BadRequestException(
+        `Failed to parse transaction envelope: ${parseError instanceof Error ? parseError.message : 'Unknown error'}`
+      );
+    }
+
+    throw new BadRequestException('Could not extract contribution amount from transaction');
+  }
+
+  /**
+   * Reads an SCVal as a string, handling common numeric types.
+   *
+   * @param scVal - The SCVal to read
+   * @returns String representation of the value, or null if not readable
+   * @private
+   */
+  private readScValAsString(scVal: any): string | null {
+    try {
+      // Try i128/u128 (common for amounts in Soroban)
+      if (typeof scVal.i128 === 'function') {
+        const i128 = scVal.i128();
+        const hi = BigInt(i128.hi().toString());
+        const lo = BigInt(i128.lo().toString());
+        const value = (hi << BigInt(64)) + lo;
+        return value.toString();
+      }
+      if (typeof scVal.u128 === 'function') {
+        const u128 = scVal.u128();
+        const hi = BigInt(u128.hi().toString());
+        const lo = BigInt(u128.lo().toString());
+        const value = (hi << BigInt(64)) + lo;
+        return value.toString();
+      }
+      // Try i64/u64
+      if (typeof scVal.i64 === 'function') {
+        return scVal.i64().toString();
+      }
+      if (typeof scVal.u64 === 'function') {
+        return scVal.u64().toString();
+      }
+      // Try i32/u32
+      if (typeof scVal.i32 === 'function') {
+        return scVal.i32().toString();
+      }
+      if (typeof scVal.u32 === 'function') {
+        return scVal.u32().toString();
+      }
+      // Try symbol
+      if (typeof scVal.sym === 'function') {
+        return scVal.sym().toString();
+      }
+      // Try string
+      if (typeof scVal.str === 'function') {
+        return scVal.str().toString();
+      }
+      // Try toString directly
+      if (typeof scVal.toString === 'function') {
+        const str = scVal.toString();
+        if (str && !isNaN(Number(str))) {
+          return str;
+        }
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+    return null;
+  }
+
+  /**
    * Returns the list of Stellar assets an account has trustlines for.
    * Used by the admin endpoint to validate group asset setup.
    */

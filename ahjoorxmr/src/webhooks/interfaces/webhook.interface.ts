@@ -22,3 +22,21 @@ export interface WebhookDeliveryJobData {
   payload: WebhookPayload;
   attempt: number;
 }
+
+export interface GroupCompletedPayload {
+  groupId: string;
+  totalRounds: number;
+  completedAt: string;
+}
+
+export interface GroupActivatedPayload {
+  groupId: string;
+  activatedAt: string;
+  totalRounds: number;
+  memberCount: number;
+}
+
+export interface GroupArchivedPayload {
+  groupId: string;
+  archivedAt: string;
+}

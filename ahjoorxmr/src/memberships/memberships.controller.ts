@@ -199,6 +199,7 @@ export class MembershipsController {
         hasPaidCurrentRound: membership.hasPaidCurrentRound,
         transactionHash: membership.transactionHash,
         status: membership.status,
+        trustScore: membership.trustScore ?? null,
         createdAt: membership.createdAt.toISOString(),
         updatedAt: membership.updatedAt.toISOString(),
       })),

@@ -8,6 +8,8 @@ import { MembershipStatus } from '../memberships/entities/membership-status.enum
 import { NotificationsService } from '../notification/notifications.service';
 import { NotificationType } from '../notification/notification-type.enum';
 import { PayoutService } from './payout.service';
+import { WebhookService, WebhookEventType } from '../webhooks/webhook.service';
+import { GroupCompletedPayload } from '../webhooks/interfaces/webhook.interface';
 
 @Injectable()
 export class RoundService {
@@ -20,6 +22,7 @@ export class RoundService {
     private readonly membershipRepository: Repository<Membership>,
     private readonly notificationsService: NotificationsService,
     private readonly payoutService: PayoutService,
+    private readonly webhookService: WebhookService,
   ) {}
 
   /**
@@ -66,6 +69,22 @@ export class RoundService {
       this.logger.log(
         `Group ${groupId} completed after ${group.totalRounds} rounds`,
       );
+
+      // Dispatch GROUP_COMPLETED webhook event
+      try {
+        const payload: GroupCompletedPayload = {
+          groupId,
+          totalRounds: group.totalRounds,
+          completedAt: new Date().toISOString(),
+        };
+        await this.webhookService.dispatchEvent(WebhookEventType.GROUP_COMPLETED, payload);
+        this.logger.log(`Dispatched GROUP_COMPLETED webhook for group ${groupId}`);
+      } catch (error) {
+        this.logger.error(
+          `Failed to dispatch GROUP_COMPLETED webhook for group ${groupId}: ${(error as Error).message}`,
+          (error as Error).stack,
+        );
+      }
 
       // Trigger payout for the last round
       try {

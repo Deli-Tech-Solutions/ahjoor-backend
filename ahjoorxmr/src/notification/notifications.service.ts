@@ -20,6 +20,7 @@ import { UseReadReplica } from '../common/decorators/read-replica.decorator';
 import { RedisService } from '../common/redis/redis.service';
 import { NotificationsGateway } from './notifications.gateway';
 import { NotificationPreferenceService } from './notification-preference.service';
+import { QueueService } from '../bullmq/queue.service';
 
 export interface PaginatedResult<T> {
   data: T[];
@@ -47,6 +48,7 @@ export class NotificationsService {
     @Inject(forwardRef(() => NotificationsGateway))
     private readonly gateway: NotificationsGateway,
     private readonly prefService: NotificationPreferenceService,
+    private readonly queueService: QueueService,
   ) {}
 
   /**

@@ -22,6 +22,8 @@ import { StellarService } from '../stellar/stellar.service';
 import { TransferAdminDto } from './dto/transfer-admin.dto';
 import { MembershipStatus } from '../memberships/entities/membership-status.enum';
 import { AuditService } from '../audit/audit.service';
+import { WebhookService, WebhookEventType } from '../webhooks/webhook.service';
+import { GroupActivatedPayload, GroupArchivedPayload } from '../webhooks/interfaces/webhook.interface';
 import { GroupTemplatesService } from './group-templates.service';
 import { GroupMaintenanceMixin } from '../common/services/group-maintenance.mixin';
 import { MaintenanceModeService } from '../common/services/maintenance-mode.service';
@@ -45,6 +47,7 @@ export class GroupsService {
     private readonly stellarService: StellarService,
     private readonly configService: ConfigService,
     private readonly auditService: AuditService,
+    private readonly webhookService: WebhookService,
     @InjectDataSource()
     private readonly dataSource: DataSource,
     private readonly groupTemplatesService: GroupTemplatesService,
@@ -396,6 +399,22 @@ export class GroupsService {
     await this.groupRepository.softDelete(id);
 
     this.logger.log(`Group ${id} soft-deleted successfully`, 'GroupsService');
+
+    // Dispatch GROUP_ARCHIVED webhook event
+    try {
+      const payload: GroupArchivedPayload = {
+        groupId: id,
+        archivedAt: new Date().toISOString(),
+      };
+      await this.webhookService.dispatchEvent(WebhookEventType.GROUP_ARCHIVED, payload);
+      this.logger.log(`Dispatched GROUP_ARCHIVED webhook for group ${id}`, 'GroupsService');
+    } catch (webhookError) {
+      this.logger.error(
+        `Failed to dispatch GROUP_ARCHIVED webhook for group ${id}: ${(webhookError as Error).message}`,
+        (webhookError as Error).stack,
+        'GroupsService',
+      );
+    }
   }
 
   /**
@@ -510,6 +529,25 @@ export class GroupsService {
           `Group ${groupId} activated and contract deployed at ${contractAddress}`,
           'GroupsService',
         );
+
+        // Dispatch GROUP_ACTIVATED webhook event
+        try {
+          const members = group.memberships || [];
+          const payload: GroupActivatedPayload = {
+            groupId,
+            activatedAt: new Date().toISOString(),
+            totalRounds: group.totalRounds,
+            memberCount: members.length,
+          };
+          await this.webhookService.dispatchEvent(WebhookEventType.GROUP_ACTIVATED, payload);
+          this.logger.log(`Dispatched GROUP_ACTIVATED webhook for group ${groupId}`, 'GroupsService');
+        } catch (webhookError) {
+          this.logger.error(
+            `Failed to dispatch GROUP_ACTIVATED webhook for group ${groupId}: ${(webhookError as Error).message}`,
+            (webhookError as Error).stack,
+            'GroupsService',
+          );
+        }
       } catch (deployError) {
         savedGroup.status = GroupStatus.PENDING;
         savedGroup.currentRound = 0;

@@ -13,6 +13,7 @@ import { ProfileIncompleteReminderService } from './services/profile-incomplete-
 import { PenaltyAssessmentJob } from '../penalties/services/penalty-assessment.job';
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { GroupInviteService } from '../groups/invites/group-invite.service';
+import { QueueService } from '../bullmq/queue.service';
 
 @Injectable()
 export class SchedulerService {
@@ -31,6 +32,7 @@ export class SchedulerService {
     private readonly penaltyAssessmentJob: PenaltyAssessmentJob,
     private readonly configService: ConfigService,
     private readonly groupInviteService: GroupInviteService,
+    private readonly queueService: QueueService,
     @InjectRepository(RefreshToken)
     private readonly refreshTokenRepository: Repository<RefreshToken>,
   ) { }
@@ -255,21 +257,37 @@ export class SchedulerService {
   }
 
   /**
-   * Hourly task: Expire stale group invites
+   * Daily task: Expire stale group invites (runs at 2 AM UTC by default)
+   * Configurable via GROUP_INVITE_EXPIRY_CRON env var.
    */
-  @Cron(CronExpression.EVERY_HOUR, { name: 'expire-group-invites' })
+  @Cron(process.env.GROUP_INVITE_EXPIRY_CRON || CronExpression.EVERY_DAY_AT_2AM, {
+    name: 'expire-group-invites',
+  })
   async handleExpireGroupInvites(): Promise<void> {
     const taskName = 'expire-group-invites';
+    const startTime = Date.now();
+
+    this.logger.log(`Starting task: ${taskName}`);
+
     const result = await this.lockService.withLock(
       taskName,
       async () => {
-        const count = await this.groupInviteService.expireStaleInvites();
-        return { count };
+        return await this.executeWithRetry(async () => {
+          const count = await this.groupInviteService.expireStaleInvites();
+          return { count };
+        }, taskName);
       },
       300,
     );
+
+    const duration = Date.now() - startTime;
+
     if (result) {
-      this.logger.log(`Task ${taskName} completed. Expired ${result.count} invites.`);
+      this.logger.log(
+        `Task ${taskName} completed successfully in ${duration}ms. Expired ${result.count} invites.`,
+      );
+    } else {
+      this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
     }
   }
 
@@ -333,6 +351,41 @@ export class SchedulerService {
     if (result) {
       this.logger.log(
         `Task ${taskName} completed successfully in ${duration}ms. Processed ${result.groupsProcessed} groups, assessed ${result.totalPenalties} penalties.`,
+      );
+    } else {
+      this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
+    }
+  }
+
+  /**
+   * Nightly task: Recalculate cross-group member trust scores (runs at 1 AM).
+   * Enqueues a BullMQ job that processes all users in batches of 200.
+   */
+  @Cron(CronExpression.EVERY_DAY_AT_1AM, { name: 'recalculate-trust-scores' })
+  async handleRecalculateTrustScores(): Promise<void> {
+    const taskName = 'recalculate-trust-scores';
+    const startTime = Date.now();
+
+    this.logger.log(`Starting task: ${taskName}`);
+
+    const result = await this.lockService.withLock(
+      taskName,
+      async () => {
+        return await this.executeWithRetry(async () => {
+          await this.queueService.addRecalculateTrustScores({
+            enqueuedAt: new Date().toISOString(),
+          });
+          return { enqueued: true };
+        }, taskName);
+      },
+      300, // 5 minutes lock TTL
+    );
+
+    const duration = Date.now() - startTime;
+
+    if (result) {
+      this.logger.log(
+        `Task ${taskName} completed successfully in ${duration}ms. Trust score recalculation job enqueued.`,
       );
     } else {
       this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
