@@ -50,6 +50,7 @@ import { ReadQueryRunner } from './database/read-query-runner';
 import { MetricsModule } from './metrics/metrics.module';
 import { MetricsInterceptor } from './metrics/metrics.interceptor';
 import { WebhookModule } from './webhooks/webhook.module';
+import { PaymentsModule } from './payments/payments.module';
 import { AdminModule } from './admin/admin.module';
 import { PenaltiesModule } from './penalties/penalties.module';
 import { Penalty } from './penalties/entities/penalty.entity';
@@ -143,6 +144,7 @@ import { MemberTrustScore } from './trust-score/entities/member-trust-score.enti
     MailModule,
     MetricsModule,
     WebhookModule,
+    PaymentsModule,
     AdminModule,
     PenaltiesModule,
     WaitlistModule,
@@ -173,7 +175,9 @@ import { MemberTrustScore } from './trust-score/entities/member-trust-score.enti
       useClass: ReadReplicaInterceptor,
     },
     ReadQueryRunner,
-    useClass: MetricsInterceptor,
+    {
+      provide: APP_GUARD,
+      useClass: MaintenanceModeGuard,
     },
     {
       provide: APP_GUARD,
