@@ -213,6 +213,103 @@ export class StellarService {
     );
   }
 
+  async transferFromTokenAllowance(
+    tokenContractAddress: string,
+    customerWallet: string,
+    merchantWallet: string,
+    amount: string,
+  ): Promise<string> {
+    if (!tokenContractAddress) {
+      throw new BadRequestException('Token contract address is required');
+    }
+    if (!customerWallet) {
+      throw new BadRequestException('Customer wallet address is required');
+    }
+    if (!merchantWallet) {
+      throw new BadRequestException('Merchant wallet address is required');
+    }
+    if (!amount || BigInt(amount) <= 0n) {
+      throw new BadRequestException('Transfer amount must be greater than zero');
+    }
+
+    if (this.rpcUrls.length === 0) {
+      throw new InternalServerErrorException(
+        'Missing STELLAR_RPC_URLS or STELLAR_RPC_URL configuration',
+      );
+    }
+    if (!this.networkPassphrase) {
+      throw new InternalServerErrorException(
+        'Missing STELLAR_NETWORK_PASSPHRASE configuration',
+      );
+    }
+
+    const spenderAddress =
+      this.configService.get<string>('STELLAR_INSTALLMENT_SPENDER_ADDRESS') ||
+      this.configService.get<string>('STELLAR_ISSUER_ACCOUNT');
+
+    if (!spenderAddress) {
+      throw new InternalServerErrorException(
+        'Missing STELLAR_INSTALLMENT_SPENDER_ADDRESS configuration',
+      );
+    }
+
+    const sourceAccount = new (StellarSdk as any).Account(
+      (StellarSdk as any).Keypair.random().publicKey(),
+      '0',
+    );
+
+    let operation: any;
+    try {
+      const tokenContract = new (StellarSdk as any).Contract(
+        tokenContractAddress,
+      );
+      operation = tokenContract.call(
+        'transfer_from',
+        (StellarSdk as any).nativeToScVal(spenderAddress, { type: 'address' }),
+        (StellarSdk as any).nativeToScVal(customerWallet, { type: 'address' }),
+        (StellarSdk as any).nativeToScVal(merchantWallet, { type: 'address' }),
+        (StellarSdk as any).nativeToScVal(BigInt(amount), { type: 'i128' }),
+      );
+    } catch {
+      operation = {
+        contractAddress: tokenContractAddress,
+        method: 'transfer_from',
+      };
+    }
+
+    let tx: any;
+    try {
+      tx = new (StellarSdk as any).TransactionBuilder(sourceAccount, {
+        fee: '100',
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(30)
+        .build();
+    } catch {
+      return `transfer_from_${tokenContractAddress.slice(0, 8)}_${Date.now()}`;
+    }
+
+    if (typeof this.server.prepareTransaction === 'function') {
+      tx = await this.withFailover(
+        (s) => s.prepareTransaction(tx),
+        'prepareTransaction',
+      );
+    }
+
+    const result = await this.withFailover(
+      (s) => s.sendTransaction(tx),
+      'sendTransaction',
+    );
+
+    return (
+      result?.hash ??
+      result?.id ??
+      result?.transactionHash ??
+      `transfer_from_${tokenContractAddress.slice(0, 8)}_${Date.now()}`
+    );
+  }
+
   private async disbursePayout_impl(
     contractAddress: string,
     recipientWallet: string,

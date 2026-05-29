@@ -17,6 +17,7 @@ export class PaymentsController {
       body.numInstallments,
       body.intervalLedgers,
       body.expiryLedger,
+      body.currentLedger ?? 0,
     );
   }
 

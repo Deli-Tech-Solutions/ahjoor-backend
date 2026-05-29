@@ -59,6 +59,7 @@ import { WaitlistModule } from './waitlist/waitlist.module';
 import { GroupWaitlist } from './waitlist/entities/group-waitlist.entity';
 import { TrustScoreModule } from './trust-score/trust-score.module';
 import { MemberTrustScore } from './trust-score/entities/member-trust-score.entity';
+import { InstallmentPaymentPlan } from './payments/entities/installment-payment-plan.entity';
 
 @Module({
   imports: [
@@ -98,6 +99,7 @@ import { MemberTrustScore } from './trust-score/entities/member-trust-score.enti
             NotificationPreference,
             GroupWaitlist,
             MemberTrustScore,
+            InstallmentPaymentPlan,
           ],
           synchronize: isDevelopment, // Auto-create tables only in development
           logging: isDevelopment, // Enable logging only in development
