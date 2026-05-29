@@ -1,4 +1,5 @@
-import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
+import { BaseEntity } from '../../common/entities/base.entity';
 import { User } from '../../users/entities/user.entity';
 
 export enum InstallmentPlanStatus {
@@ -8,15 +9,20 @@ export enum InstallmentPlanStatus {
   PAUSED = 'PAUSED',
 }
 
-@Entity()
-export class InstallmentPaymentPlan {
-  @PrimaryGeneratedColumn('uuid')
-  id: string;
+@Entity('installment_payment_plans')
+export class InstallmentPaymentPlan extends BaseEntity {
+  @Column('uuid')
+  customerId: string;
 
   @ManyToOne(() => User, { nullable: false })
+  @JoinColumn({ name: 'customerId' })
   customer: User;
 
+  @Column('uuid')
+  merchantId: string;
+
   @ManyToOne(() => User, { nullable: false })
+  @JoinColumn({ name: 'merchantId' })
   merchant: User;
 
   @Column()
@@ -40,7 +46,12 @@ export class InstallmentPaymentPlan {
   @Column('int')
   expiryLedger: number;
 
-  @Column({ type: 'enum', enum: InstallmentPlanStatus, default: InstallmentPlanStatus.ACTIVE })
+  @Column({
+    type: 'enum',
+    enum: InstallmentPlanStatus,
+    enumName: 'installment_plan_status',
+    default: InstallmentPlanStatus.ACTIVE,
+  })
   status: InstallmentPlanStatus;
 
   @Column('decimal', { precision: 36, scale: 18, array: true })
@@ -49,9 +60,9 @@ export class InstallmentPaymentPlan {
   @Column({ default: false })
   paused: boolean;
 
-  @CreateDateColumn()
-  createdAt: Date;
+  @Column('text', { array: true, default: () => "'{}'" })
+  settlementTransactionHashes: string[];
 
-  @UpdateDateColumn()
-  updatedAt: Date;
+  @Column('decimal', { precision: 36, scale: 18, nullable: true })
+  lastSettledAmount?: string | null;
 }
