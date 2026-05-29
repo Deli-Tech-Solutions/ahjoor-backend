@@ -55,6 +55,7 @@ import { AdminModule } from './admin/admin.module';
 import { PenaltiesModule } from './penalties/penalties.module';
 import { Penalty } from './penalties/entities/penalty.entity';
 import { NotificationPreference } from './notification/notification-preference.entity';
+import { MaintenanceModeGuard } from './common/guards/maintenance-mode.guard';
 import { WaitlistModule } from './waitlist/waitlist.module';
 import { GroupWaitlist } from './waitlist/entities/group-waitlist.entity';
 import { TrustScoreModule } from './trust-score/trust-score.module';
@@ -174,6 +175,10 @@ import { MemberTrustScore } from './trust-score/entities/member-trust-score.enti
       useClass: ReadReplicaInterceptor,
     },
     ReadQueryRunner,
+    {
+      provide: APP_GUARD,
+      useClass: MaintenanceModeGuard,
+    },
     {
       provide: APP_GUARD,
       useClass: MaintenanceModeGuard,
