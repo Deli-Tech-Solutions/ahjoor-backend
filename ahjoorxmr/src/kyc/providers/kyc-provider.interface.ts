@@ -1,10 +1,10 @@
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 export interface ParsedWebhookPayload {
   /** Internal user ID extracted from the payload */
   userId: string;
-  /** Provider's own reference ID for this verification */
-  providerReferenceId: string;
+  /** Provider's own case/reference ID for this verification */
+  providerCaseId: string;
   /** Normalised status mapped to our internal enum */
   status: KycStatus;
   /** Raw payload for audit storage */

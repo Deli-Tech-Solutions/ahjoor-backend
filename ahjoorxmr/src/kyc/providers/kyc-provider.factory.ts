@@ -15,8 +15,17 @@ export class KycProviderFactory {
     this.parser = KycProviderFactory.createParser(provider as KycProvider);
   }
 
-  getParser(): KycProviderParser {
-    return this.parser;
+  /**
+   * Returns the parser for a specific provider (needed when a case has
+   * failed over to a secondary provider, whose callback must be parsed with
+   * its own signature scheme/payload shape). Falls back to the app's
+   * configured default provider when none is given.
+   */
+  getParser(provider?: KycProvider): KycProviderParser {
+    if (!provider) {
+      return this.parser;
+    }
+    return KycProviderFactory.createParser(provider);
   }
 
   static createParser(provider: KycProvider): KycProviderParser {

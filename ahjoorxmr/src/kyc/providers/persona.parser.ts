@@ -1,14 +1,14 @@
 import * as crypto from 'crypto';
 import { BadRequestException } from '@nestjs/common';
 import { KycProviderParser, ParsedWebhookPayload } from './kyc-provider.interface';
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 /** Persona status → internal KycStatus */
 const STATUS_MAP: Record<string, KycStatus> = {
   approved: KycStatus.APPROVED,
   completed: KycStatus.APPROVED,
-  declined: KycStatus.DECLINED,
-  failed: KycStatus.DECLINED,
+  declined: KycStatus.REJECTED,
+  failed: KycStatus.REJECTED,
   needs_review: KycStatus.NEEDS_REVIEW,
   created: KycStatus.PENDING,
   pending: KycStatus.PENDING,
@@ -40,13 +40,13 @@ export class PersonaParser implements KycProviderParser {
     const userId = String(
       (attributes['reference-id'] as string | undefined) ?? '',
     );
-    const providerReferenceId = String(data['id'] ?? '');
+    const providerCaseId = String(data['id'] ?? '');
 
     if (!userId) throw new BadRequestException('Persona payload missing reference-id');
 
     return {
       userId,
-      providerReferenceId,
+      providerCaseId,
       status: STATUS_MAP[providerStatus] ?? KycStatus.NEEDS_REVIEW,
       raw: body,
     };

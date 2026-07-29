@@ -8,9 +8,8 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
-import { Request } from 'express';
 import { KycWebhookService } from './kyc-webhook.service';
-import { WebhookHmacGuard } from './guards/webhook-hmac.guard';
+import { WebhookHmacGuard, KycWebhookRequest } from './guards/webhook-hmac.guard';
 
 @ApiTags('KYC')
 @Controller('kyc')
@@ -29,9 +28,9 @@ export class KycWebhookController {
   })
   @ApiResponse({ status: 200, description: 'Webhook processed successfully' })
   @ApiResponse({ status: 401, description: 'Invalid or missing HMAC signature' })
-  async handleWebhook(@Req() req: Request & { rawBody?: Buffer }): Promise<{ received: true }> {
+  async handleWebhook(@Req() req: KycWebhookRequest): Promise<{ received: true }> {
     const rawBody = req.rawBody ?? Buffer.from(JSON.stringify(req.body));
-    await this.kycWebhookService.processWebhook(rawBody);
+    await this.kycWebhookService.processWebhook(rawBody, req.kycProvider);
     return { received: true };
   }
 }

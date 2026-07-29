@@ -14,6 +14,7 @@ import { PenaltyAssessmentJob } from '../penalties/services/penalty-assessment.j
 import { RefreshToken } from '../auth/entities/refresh-token.entity';
 import { GroupInviteService } from '../groups/invites/group-invite.service';
 import { QueueService } from '../bullmq/queue.service';
+import { KycStuckCaseDetectorService } from '../kyc/services/kyc-stuck-case-detector.service';
 
 @Injectable()
 export class SchedulerService {
@@ -33,6 +34,7 @@ export class SchedulerService {
     private readonly configService: ConfigService,
     private readonly groupInviteService: GroupInviteService,
     private readonly queueService: QueueService,
+    private readonly kycStuckCaseDetectorService: KycStuckCaseDetectorService,
     @InjectRepository(RefreshToken)
     private readonly refreshTokenRepository: Repository<RefreshToken>,
   ) { }
@@ -386,6 +388,38 @@ export class SchedulerService {
     if (result) {
       this.logger.log(
         `Task ${taskName} completed successfully in ${duration}ms. Trust score recalculation job enqueued.`,
+      );
+    } else {
+      this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);
+    }
+  }
+
+  /**
+   * Hourly task: Flag KYC cases stuck in PENDING with no provider callback
+   * (see KycStuckCaseDetectorService for the timeout heuristic).
+   */
+  @Cron(CronExpression.EVERY_HOUR, { name: 'detect-stuck-kyc-cases' })
+  async handleStuckKycDetection(): Promise<void> {
+    const taskName = 'detect-stuck-kyc-cases';
+    const startTime = Date.now();
+
+    this.logger.log(`Starting task: ${taskName}`);
+
+    const result = await this.lockService.withLock(
+      taskName,
+      async () => {
+        return await this.executeWithRetry(async () => {
+          return await this.kycStuckCaseDetectorService.detectAndFlagStuckCases();
+        }, taskName);
+      },
+      300, // 5 minutes lock TTL
+    );
+
+    const duration = Date.now() - startTime;
+
+    if (result) {
+      this.logger.log(
+        `Task ${taskName} completed successfully in ${duration}ms. Flagged ${result.flaggedCount} stuck KYC case(s).`,
       );
     } else {
       this.logger.warn(`Task ${taskName} was skipped (lock not acquired)`);

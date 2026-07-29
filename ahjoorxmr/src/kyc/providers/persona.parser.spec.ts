@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 import { PersonaParser } from './persona.parser';
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 const SECRET = 'test-secret';
 
@@ -53,14 +53,14 @@ describe('PersonaParser', () => {
       const result = parser.parse(Buffer.from(body));
       expect(result.status).toBe(KycStatus.APPROVED);
       expect(result.userId).toBe('user-1');
-      expect(result.providerReferenceId).toBe('inq_abc');
+      expect(result.providerCaseId).toBe('inq_abc');
     });
 
-    it('maps declined → KycStatus.DECLINED', () => {
+    it('maps declined → KycStatus.REJECTED', () => {
       const body = JSON.stringify({
         data: { id: 'inq_abc', attributes: { status: 'declined', 'reference-id': 'user-1' } },
       });
-      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.DECLINED);
+      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.REJECTED);
     });
 
     it('maps needs_review → KycStatus.NEEDS_REVIEW', () => {

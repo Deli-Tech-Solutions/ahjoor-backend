@@ -9,7 +9,7 @@ import { TwoFactorService } from './two-factor.service';
 import { NotificationsService } from '../notification/notifications.service';
 import { User } from '../users/entities/user.entity';
 import { AuditLog } from '../kyc/entities/audit-log.entity';
-import { KycStatus } from '../kyc/enums/kyc-status.enum';
+import { KycStatus } from '../kyc/entities/kyc-status.enum';
 import { NotificationType } from '../notification/enums/notification-type.enum';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

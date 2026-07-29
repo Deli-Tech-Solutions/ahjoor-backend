@@ -21,6 +21,7 @@ import { NotificationsService } from '../notification/notifications.service';
 import { NotificationType } from '../notification/notification-type.enum';
 import { WinstonLogger } from '../common/logger/winston.logger';
 import { scrubForLog } from '../common/pii/pii-scrubber';
+import { KycProviderOrchestrator } from './providers/kyc-provider-orchestrator.service';
 
 const KYC_ALLOWED_MIME = ['image/jpeg', 'image/png', 'application/pdf'];
 
@@ -62,6 +63,7 @@ export class KycService {
     private readonly notificationsService: NotificationsService,
     private readonly configService: ConfigService,
     private readonly winstonLogger: WinstonLogger,
+    private readonly providerOrchestrator: KycProviderOrchestrator,
   ) {
     this.bucket = this.configService.get<string>('AWS_S3_BUCKET') ?? null;
     this.useS3 = !!this.bucket;
@@ -112,7 +114,13 @@ export class KycService {
 
     const saved = await this.kycDocumentRepository.save(doc);
 
-    await this.userRepository.update(userId, { kycStatus: KycStatus.PENDING });
+    const orchestrated = await this.providerOrchestrator.submitOrReuse(
+      user,
+      saved,
+      file.buffer,
+    );
+
+    await this.userRepository.update(userId, { kycStatus: orchestrated.status });
 
     await this.notificationsService.notify({
       userId,
@@ -130,7 +138,7 @@ export class KycService {
     });
     this.winstonLogger.log(`KYC document uploaded: ${JSON.stringify(safeDoc)}`, 'KycService');
 
-    return saved;
+    return orchestrated;
   }
 
   async getLatestDocument(userId: string): Promise<KycDocument & { kycStatus: KycStatus }> {
