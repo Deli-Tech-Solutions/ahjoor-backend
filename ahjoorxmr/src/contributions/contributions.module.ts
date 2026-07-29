@@ -1,7 +1,9 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ContributionsController } from './contributions.controller';
 import { ContributionsService } from './contributions.service';
+import { ContributionReconciliationService } from './contribution-reconciliation.service';
 import { ReceiptService } from './receipt.service';
 import { Contribution } from './entities/contribution.entity';
 import { Group } from '../groups/entities/group.entity';
@@ -16,6 +18,7 @@ import { GroupsModule } from '../groups/groups.module';
 import { NotificationsModule } from '../notification/notifications.module';
 import { WebhookModule } from '../webhooks/webhook.module';
 import { QueueModule } from '../bullmq/queue.module';
+import { CommonModule } from '../common/common.module';
 
 /**
  * ContributionsModule manages member contributions in a group-based ROSCA system.
@@ -25,15 +28,17 @@ import { QueueModule } from '../bullmq/queue.module';
 @Module({
   imports: [
     TypeOrmModule.forFeature([Contribution, Group, Membership, User]),
+    ScheduleModule.forRoot(),
     StellarModule,
     ConfigModule,
     GroupsModule,
     NotificationsModule,
     forwardRef(() => WebhookModule),
     forwardRef(() => QueueModule),
+    CommonModule,
   ],
   controllers: [ContributionsController],
-  providers: [ContributionsService, ReceiptService, WinstonLogger, ApiKeyGuard, JwtAuthGuard],
+  providers: [ContributionsService, ContributionReconciliationService, ReceiptService, WinstonLogger, ApiKeyGuard, JwtAuthGuard],
   exports: [ContributionsService],
 })
 export class ContributionsModule {}

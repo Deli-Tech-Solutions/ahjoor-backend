@@ -3,10 +3,11 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, QueryFailedError } from 'typeorm';
-import { Contribution } from './entities/contribution.entity';
+import { Repository, QueryFailedError, LessThan } from 'typeorm';
+import { Contribution, ContributionStatus } from './entities/contribution.entity';
 import { Group } from '../groups/entities/group.entity';
 import { Membership } from '../memberships/entities/membership.entity';
 import { MembershipStatus } from '../memberships/entities/membership-status.enum';
@@ -21,6 +22,13 @@ import { UseReadReplica } from '../common/decorators/read-replica.decorator';
 import { WebhookService } from '../webhooks/webhook.service';
 import { QueueService } from '../bullmq/queue.service';
 import { GroupMaintenanceMixin } from '../common/services/group-maintenance.mixin';
+import { RedisService } from '../common/redis/redis.service';
+
+/** TTL for the in-flight Redis lock (seconds). Must exceed the longest expected Stellar submission. */
+const IN_FLIGHT_LOCK_TTL_S = 60;
+/** How long to poll for an in-flight result before giving up (ms). */
+const IN_FLIGHT_POLL_TIMEOUT_MS = 55_000;
+const IN_FLIGHT_POLL_INTERVAL_MS = 500;
 
 /**
  * Service responsible for managing contribution operations in ROSCA groups.
@@ -42,6 +50,7 @@ export class ContributionsService {
     private readonly webhookService: WebhookService,
     private readonly queueService: QueueService,
     private readonly groupMaintenanceMixin: GroupMaintenanceMixin,
+    private readonly redisService: RedisService,
   ) {}
 
   /**
@@ -78,42 +87,80 @@ export class ContributionsService {
    */
   async createContribution(
     createContributionDto: CreateContributionDto,
+    idempotencyKey?: string,
   ): Promise<Contribution> {
-    const { groupId, userId, transactionHash, roundNumber } =
-      createContributionDto;
+    const { groupId, userId, transactionHash, roundNumber } = createContributionDto;
 
     this.logger.log(
-      `Creating contribution for user ${userId} in group ${groupId} with transaction hash ${transactionHash}`,
+      `Creating contribution for user ${userId} in group ${groupId} tx=${transactionHash}`,
       'ContributionsService',
     );
 
-    try {
-      // Validate group exists and fetch it
-      const group = await this.validateGroupExists(groupId);
+    // ── 1. Idempotency: if a completed record already exists for this key, return it ──
+    if (idempotencyKey) {
+      const existing = await this.contributionRepository.findOne({
+        where: { idempotencyKey },
+      });
+      if (existing) {
+        if (
+          existing.status === ContributionStatus.CONFIRMED ||
+          existing.status === ContributionStatus.FAILED
+        ) {
+          this.logger.log(
+            `Idempotency hit (terminal): key=${idempotencyKey} id=${existing.id}`,
+            'ContributionsService',
+          );
+          return existing;
+        }
 
-      // Check if group is under maintenance mode
+        // Status is PENDING or ON_CHAIN_SUBMITTED — another request is in-flight.
+        // Block and wait for it to reach a terminal state.
+        return this.waitForInFlight(idempotencyKey, existing.id);
+      }
+    }
+
+    // ── 2. Acquire in-flight lock so concurrent retries queue behind us ──
+    const lockKey = idempotencyKey ? `contrib:inflight:${idempotencyKey}` : null;
+    if (lockKey) {
+      const acquired = await this.redisService.setIfNotExistsWithExpiry(
+        lockKey,
+        'locked',
+        IN_FLIGHT_LOCK_TTL_S,
+      );
+      if (!acquired) {
+        // Another request is already processing this key — wait for it.
+        const existingAfterLock = await this.contributionRepository.findOne({
+          where: { idempotencyKey },
+        });
+        if (existingAfterLock) {
+          return this.waitForInFlight(idempotencyKey!, existingAfterLock.id);
+        }
+        // Lock exists but no DB row yet — wait briefly and retry once
+        await new Promise((r) => setTimeout(r, IN_FLIGHT_POLL_INTERVAL_MS));
+        const retryExisting = await this.contributionRepository.findOne({
+          where: { idempotencyKey },
+        });
+        if (retryExisting) {
+          return this.waitForInFlight(idempotencyKey!, retryExisting.id);
+        }
+        throw new ConflictException('Concurrent request with same idempotency key is in progress');
+      }
+    }
+
+    try {
+      // ── 3. Validate group / membership / window / round ──
+      const group = await this.validateGroupExists(groupId);
       await this.groupMaintenanceMixin.checkGroupMaintenance(groupId);
 
-      // Check membership status — suspended members cannot contribute
-      const membership = await this.membershipRepository.findOne({
-        where: { groupId, userId },
-      });
+      const membership = await this.membershipRepository.findOne({ where: { groupId, userId } });
       if (membership?.status === MembershipStatus.SUSPENDED) {
         throw new ForbiddenException('Suspended members cannot submit contributions');
       }
 
-      // Validate group status is ACTIVE
       if (group.status !== GroupStatus.ACTIVE) {
-        this.logger.warn(
-          `Cannot create contribution for group ${groupId} with status ${group.status}`,
-          'ContributionsService',
-        );
-        throw new BadRequestException(
-          'Contributions can only be made to ACTIVE groups',
-        );
+        throw new BadRequestException('Contributions can only be made to ACTIVE groups');
       }
 
-      // Validate contribution window using timezone-aware comparison
       const now = new Date();
       if (group.startDate && now < group.startDate) {
         throw new BadRequestException(
@@ -126,119 +173,44 @@ export class ContributionsService {
         );
       }
 
-      // Validate round number matches current round
       if (roundNumber !== group.currentRound) {
-        this.logger.warn(
-          `Round number mismatch for group ${groupId}: provided ${roundNumber}, current ${group.currentRound}`,
-          'ContributionsService',
-        );
-        throw new BadRequestException(
-          'Contributions can only be made for the current round',
-        );
+        throw new BadRequestException('Contributions can only be made for the current round');
       }
 
-      // Verify contribution if enabled
-      const shouldVerify = this.configService.get<boolean>(
-        'VERIFY_CONTRIBUTIONS',
-        true,
-      );
+      // ── 4. Stellar verification ──
+      const shouldVerify = this.configService.get<boolean>('VERIFY_CONTRIBUTIONS', true);
       if (shouldVerify) {
-        // Use group's contract address if available, fall back to global address
-        if (group.contractAddress) {
-          const isValid = await this.stellarService.verifyContributionForGroup(
-            transactionHash,
-            group.contractAddress,
-          );
-          if (!isValid) {
-            this.logger.warn(
-              `Contribution verification failed for transaction hash ${transactionHash} against group contract ${group.contractAddress}`,
-              'ContributionsService',
-            );
-            throw new BadRequestException(
-              'Transaction hash does not correspond to a valid contribution',
-            );
-          }
-          this.logger.log(
-            `Contribution verification successful for transaction hash ${transactionHash} against group contract ${group.contractAddress}`,
-            'ContributionsService',
-          );
-        } else {
-          // Fall back to global contract address
-          this.logger.warn(
-            `Group ${groupId} has no contractAddress, falling back to global CONTRACT_ADDRESS`,
-            'ContributionsService',
-          );
-          const isValid = await this.stellarService.verifyContributionForGroup(
-            transactionHash,
-            null,
-          );
-          if (!isValid) {
-            this.logger.warn(
-              `Contribution verification failed for transaction hash ${transactionHash}`,
-              'ContributionsService',
-            );
-            throw new BadRequestException(
-              'Transaction hash does not correspond to a valid contribution',
-            );
-          }
-          this.logger.log(
-            `Contribution verification successful for transaction hash ${transactionHash}`,
-            'ContributionsService',
+        const isValid = await this.stellarService.verifyContributionForGroup(
+          transactionHash,
+          group.contractAddress ?? null,
+        );
+        if (!isValid) {
+          throw new BadRequestException(
+            'Transaction hash does not correspond to a valid contribution',
           );
         }
 
-        // Verify contribution amount and asset match group requirements
         try {
           const txDetails = await this.stellarService.getTransactionAmount(transactionHash);
-          const requiredAmount = group.contributionAmount;
           const requiredAsset = (group.assetCode ?? 'XLM').toUpperCase();
           const txAsset = txDetails.assetCode.toUpperCase();
-
-          // Check asset matches
           if (txAsset !== requiredAsset) {
-            this.logger.warn(
-              `Asset mismatch for transaction ${transactionHash}: expected ${requiredAsset}, got ${txAsset}`,
-              'ContributionsService',
-            );
             throw new BadRequestException(
               `Transaction asset (${txAsset}) does not match group required asset (${requiredAsset})`,
             );
           }
-
-          // Check amount meets requirement
           const txAmountNum = Number(txDetails.amount);
-          const requiredAmountNum = Number(requiredAmount);
-
+          const requiredAmountNum = Number(group.contributionAmount);
           if (isNaN(txAmountNum) || isNaN(requiredAmountNum)) {
-            this.logger.warn(
-              `Invalid amount format: txAmount=${txDetails.amount}, requiredAmount=${requiredAmount}`,
-              'ContributionsService',
-            );
-            throw new BadRequestException(
-              'Unable to parse transaction amount for verification',
-            );
+            throw new BadRequestException('Unable to parse transaction amount for verification');
           }
-
           if (txAmountNum < requiredAmountNum) {
-            this.logger.warn(
-              `Amount insufficient for transaction ${transactionHash}: required ${requiredAmount}, got ${txDetails.amount}`,
-              'ContributionsService',
-            );
             throw new BadRequestException(
-              `Transaction amount (${txDetails.amount}) is less than required contribution amount (${requiredAmount})`,
+              `Transaction amount (${txDetails.amount}) is less than required contribution amount (${group.contributionAmount})`,
             );
           }
-
-          this.logger.log(
-            `Amount verification passed for transaction ${transactionHash}: ${txDetails.amount} ${txAsset} meets requirement of ${requiredAmount} ${requiredAsset}`,
-            'ContributionsService',
-          );
         } catch (amountError) {
-          // If it's already a BadRequestException, re-throw it
-          if (amountError instanceof BadRequestException) {
-            throw amountError;
-          }
-          // Log other errors but don't block contribution (conservative approach)
+          if (amountError instanceof BadRequestException) throw amountError;
           this.logger.error(
             `Failed to verify transaction amount for ${transactionHash}: ${(amountError as Error).message}`,
             (amountError as Error).stack,
@@ -250,6 +222,7 @@ export class ContributionsService {
         }
       }
 
+      // ── 5. Persist with status=PENDING (phase 1 complete) ──
       const insertResult = await this.contributionRepository
         .createQueryBuilder()
         .insert()
@@ -264,6 +237,8 @@ export class ContributionsService {
           timestamp: createContributionDto.timestamp,
           assetCode: group.assetCode ?? 'XLM',
           assetIssuer: group.assetIssuer ?? null,
+          status: ContributionStatus.PENDING,
+          idempotencyKey: idempotencyKey ?? null,
         })
         .orIgnore()
         .execute();
@@ -275,10 +250,7 @@ export class ContributionsService {
       }
 
       const newId = insertResult.identifiers[0].id as string;
-      const savedContribution = await this.contributionRepository.findOne({
-        where: { id: newId },
-      });
-
+      const savedContribution = await this.contributionRepository.findOne({ where: { id: newId } });
       if (!savedContribution) {
         throw new ConflictException(
           'A contribution for this user and round already exists in this group, or this transaction was already recorded',
@@ -286,22 +258,17 @@ export class ContributionsService {
       }
 
       this.logger.log(
-        `Contribution created with id ${savedContribution.id} for user ${userId} in group ${groupId}`,
+        `Contribution ${savedContribution.id} persisted (PENDING) for user ${userId} in group ${groupId}`,
         'ContributionsService',
       );
 
-      // Trigger webhook notification asynchronously
-      this.webhookService
-        .notifyContributionVerified(savedContribution)
-        .catch((error) => {
-          this.logger.error(
-            `Failed to trigger webhook for contribution ${savedContribution.id}: ${error.message}`,
-            error.stack,
-            'ContributionsService',
-          );
-        });
+      // ── 6. Transition to ON_CHAIN_SUBMITTED (phase 2 begins) ──
+      await this.contributionRepository.update(savedContribution.id, {
+        status: ContributionStatus.ON_CHAIN_SUBMITTED,
+      });
+      savedContribution.status = ContributionStatus.ON_CHAIN_SUBMITTED;
 
-      // Enqueue transaction confirmation tracking job
+      // ── 7. Enqueue confirmation job (phase 2 tracking) ──
       const timeoutMs = this.configService.get<number>('TX_CONFIRMATION_TIMEOUT_MS', 120_000);
       this.queueService
         .addTxConfirmation({
@@ -310,71 +277,143 @@ export class ContributionsService {
           userId: savedContribution.userId,
           deadline: Date.now() + timeoutMs,
         })
-        .catch((error) => {
+        .catch((err) => {
           this.logger.error(
-            `Failed to enqueue tx confirmation for contribution ${savedContribution.id}: ${error.message}`,
-            error.stack,
+            `Failed to enqueue tx confirmation for contribution ${savedContribution.id}: ${err.message}`,
+            err.stack,
             'ContributionsService',
           );
         });
 
-      // Attempt automatic round advancement — no-ops if not all members have paid
+      // ── 8. Async side-effects ──
+      this.webhookService.notifyContributionVerified(savedContribution).catch((err) => {
+        this.logger.error(
+          `Webhook failed for contribution ${savedContribution.id}: ${err.message}`,
+          err.stack,
+          'ContributionsService',
+        );
+      });
+
       await this.roundService.tryAdvanceRound(groupId);
 
       return savedContribution;
     } catch (error) {
-      // Re-throw known exceptions
       if (
         error instanceof BadRequestException ||
-        error instanceof ConflictException
+        error instanceof ConflictException ||
+        error instanceof ForbiddenException ||
+        error instanceof HttpException
       ) {
         throw error;
       }
 
-      // Handle database errors
       if (error instanceof QueryFailedError) {
         const pgError = error as any;
-
-        // Unique constraint violation
         if (pgError.code === '23505') {
           const constraint = pgError.constraint || '';
-          this.logger.error(
-            `Unique constraint violation: ${constraint}`,
-            error.stack,
-            'ContributionsService',
-          );
-
           if (constraint === 'UQ_contributions_userId_groupId_roundNumber') {
             throw new ConflictException(
               'A contribution for this user and round already exists in this group',
             );
           }
-
-          // Default duplicate message (e.g. for transactionHash)
-          throw new ConflictException(
-            'Contribution with this transaction hash already exists',
-          );
+          throw new ConflictException('Contribution with this transaction hash already exists');
         }
-
-        // Foreign key violation (invalid groupId or userId)
         if (pgError.code === '23503') {
-          this.logger.error(
-            `Foreign key violation when creating contribution for user ${userId} in group ${groupId}`,
-            error.stack,
-            'ContributionsService',
-          );
           throw new BadRequestException('Invalid groupId or userId');
         }
       }
 
-      // Log and re-throw unexpected errors
       this.logger.error(
-        `Failed to create contribution for user ${userId} in group ${groupId}: ${error.message}`,
-        error.stack,
+        `Failed to create contribution for user ${userId} in group ${groupId}: ${(error as Error).message}`,
+        (error as Error).stack,
         'ContributionsService',
       );
       throw error;
+    } finally {
+      // Always release the in-flight lock
+      if (lockKey) {
+        await this.redisService.del(lockKey);
+      }
     }
+  }
+
+  /**
+   * Polls until the contribution with the given idempotency key reaches a terminal state.
+   * Used to serialize concurrent retries of the same idempotency key.
+   */
+  private async waitForInFlight(idempotencyKey: string, contributionId: string): Promise<Contribution> {
+    const deadline = Date.now() + IN_FLIGHT_POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, IN_FLIGHT_POLL_INTERVAL_MS));
+      const contribution = await this.contributionRepository.findOne({
+        where: { id: contributionId },
+      });
+      if (!contribution) {
+        throw new ConflictException('In-flight contribution disappeared unexpectedly');
+      }
+      if (
+        contribution.status === ContributionStatus.CONFIRMED ||
+        contribution.status === ContributionStatus.FAILED
+      ) {
+        this.logger.log(
+          `In-flight wait resolved: key=${idempotencyKey} id=${contributionId} status=${contribution.status}`,
+          'ContributionsService',
+        );
+        return contribution;
+      }
+    }
+    // Timed out waiting — return the current (non-terminal) record so the caller
+    // can decide what to do; reconciliation will eventually resolve it.
+    const contribution = await this.contributionRepository.findOneOrFail({
+      where: { id: contributionId },
+    });
+    return contribution;
+  }
+
+  /**
+   * Reconciles contributions stuck in ON_CHAIN_SUBMITTED by querying Stellar directly.
+   * Called by the reconciliation scheduler on startup and periodically.
+   */
+  async reconcileStuckContributions(staleAfterMs = 60_000): Promise<void> {
+    const cutoff = new Date(Date.now() - staleAfterMs);
+    const stuck = await this.contributionRepository.find({
+      where: { status: ContributionStatus.ON_CHAIN_SUBMITTED, updatedAt: LessThan(cutoff) },
+    });
+
+    if (!stuck.length) return;
+
+    this.logger.log(
+      `Reconciling ${stuck.length} ON_CHAIN_SUBMITTED contribution(s) older than ${staleAfterMs}ms`,
+      'ContributionsService',
+    );
+
+    await Promise.allSettled(
+      stuck.map(async (contribution) => {
+        try {
+          const txStatus = await this.stellarService.getTransactionStatus(
+            contribution.transactionHash,
+          );
+
+          let newStatus: ContributionStatus | null = null;
+          if (txStatus === 'CONFIRMED') newStatus = ContributionStatus.CONFIRMED;
+          else if (txStatus === 'FAILED') newStatus = ContributionStatus.FAILED;
+
+          if (newStatus) {
+            await this.contributionRepository.update(contribution.id, { status: newStatus });
+            this.logger.log(
+              `Reconciled contribution ${contribution.id} → ${newStatus} (tx=${contribution.transactionHash})`,
+              'ContributionsService',
+            );
+          }
+        } catch (err) {
+          this.logger.error(
+            `Reconciliation failed for contribution ${contribution.id}: ${(err as Error).message}`,
+            (err as Error).stack,
+            'ContributionsService',
+          );
+        }
+      }),
+    );
   }
 
   /**

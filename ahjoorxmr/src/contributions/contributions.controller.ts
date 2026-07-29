@@ -113,9 +113,12 @@ export class ContributionsController {
   @AuditLog({ action: 'CREATE', resource: 'CONTRIBUTION' })
   async createContribution(
     @Body() createContributionDto: CreateContributionDto,
+    @Request() req: { headers: Record<string, string> },
   ): Promise<ContributionResponseDto> {
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
     const contribution = await this.contributionsService.createContribution(
       createContributionDto,
+      idempotencyKey,
     );
 
     // Transform entity to response DTO with ISO date strings
