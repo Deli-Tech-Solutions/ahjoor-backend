@@ -1,6 +1,13 @@
-import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { CongestionMonitorService, CongestionState } from './congestion-monitor.service';
+import {
+  CongestionMonitorService,
+  CongestionState,
+} from './congestion-monitor.service';
 
 interface CircuitState {
   failures: number;
@@ -40,10 +47,8 @@ export class StellarCircuitBreakerService {
       5,
     );
     this.baseTimeoutMs =
-      this.configService.get<number>(
-        'STELLAR_CIRCUIT_BREAKER_TIMEOUT',
-        60,
-      ) * 1000;
+      this.configService.get<number>('STELLAR_CIRCUIT_BREAKER_TIMEOUT', 60) *
+      1000;
     this.networkName = this.configService.get<string>(
       'STELLAR_NETWORK',
       'testnet',
@@ -87,6 +92,9 @@ export class StellarCircuitBreakerService {
         });
       }
 
+      // Mark probe start immediately so concurrent/rapid calls are rate-limited
+      // even while this probe is still in flight.
+      this.state.lastHalfOpenProbeAt = Date.now();
       this.logger.log('Circuit half-open, attempting recovery probe');
     }
 
@@ -222,7 +230,7 @@ export class StellarCircuitBreakerService {
             },
           }),
         );
-        this.sendWebhookAlert(err.message, congestionState).catch(() => { });
+        this.sendWebhookAlert(err.message, congestionState).catch(() => {});
       }
     }
   }
