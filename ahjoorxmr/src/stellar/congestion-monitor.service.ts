@@ -114,7 +114,8 @@ export class CongestionMonitorService {
     this.cleanOldSamples();
 
     const totalAttempts = this.successfulAttempts + this.failedAttempts;
-    const errorRate = totalAttempts > 0 ? this.failedAttempts / totalAttempts : 0;
+    const errorRate =
+      totalAttempts > 0 ? this.failedAttempts / totalAttempts : 0;
 
     // Calculate percentiles
     const { p95, p99 } = this.calculatePercentiles();

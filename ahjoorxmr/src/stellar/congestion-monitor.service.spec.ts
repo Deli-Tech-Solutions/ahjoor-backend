@@ -86,7 +86,7 @@ describe('CongestionMonitorService', () => {
       // Scenario 1: Congestion (high latency, low error rate)
       service.reset();
       for (let i = 0; i < 20; i++) {
-        service.recordSuccess(4000); // High latency
+        service.recordSuccess(6000); // High latency, above P99 threshold
       }
       service.recordFailure(); // Very low error rate
 
@@ -171,7 +171,7 @@ describe('CongestionMonitorService', () => {
       // Simulate sustained slow network: 95% success rate, all requests take 4-5 seconds
       service.reset();
       for (let i = 0; i < 20; i++) {
-        service.recordSuccess(4500 + Math.random() * 500);
+        service.recordSuccess(5500 + Math.random() * 500);
       }
       service.recordFailure(); // 1 failure out of 21 = ~4.8% error rate
 
@@ -179,7 +179,7 @@ describe('CongestionMonitorService', () => {
 
       // This should be detected as congestion (not outage)
       expect(state.isCongestioned).toBe(true);
-      expect(state.p99LatencyMs).toBeGreaterThan(4000);
+      expect(state.p99LatencyMs).toBeGreaterThan(5000);
       expect(state.errorRate).toBeLessThan(0.25); // Below outage threshold
       expect(state.totalAttempts).toBe(21);
     });
@@ -283,14 +283,14 @@ describe('CongestionMonitorService', () => {
 
       // Record all high latencies
       for (let i = 0; i < 20; i++) {
-        service.recordSuccess(3000); // All above P95 threshold of 2000ms
+        service.recordSuccess(6000); // Above both P95 (2000ms) and P99 (5000ms) thresholds
       }
 
       const state = service.getState();
 
       expect(state.isCongestionedStrict).toBe(true);
       expect(state.p95LatencyMs).toBeGreaterThanOrEqual(2000);
-      expect(state.p99LatencyMs).toBeGreaterThanOrEqual(2000);
+      expect(state.p99LatencyMs).toBeGreaterThanOrEqual(5000);
     });
   });
 

@@ -59,9 +59,9 @@ describe('StellarCircuitBreakerService', () => {
 
     it('should throw on failed operations', async () => {
       const error = new Error('RPC failed');
-      await expect(service.execute(async () => Promise.reject(error))).rejects.toThrow(
-        'RPC failed',
-      );
+      await expect(
+        service.execute(async () => Promise.reject(error)),
+      ).rejects.toThrow('RPC failed');
     });
 
     it('should trip circuit after threshold failures', async () => {
@@ -101,8 +101,8 @@ describe('StellarCircuitBreakerService', () => {
       jest.useFakeTimers();
       jest.advanceTimersByTime(61000); // Advance past 60s timeout
 
-      // First probe attempt should be allowed
-      const probe1 = service.execute(async () => 'success');
+      // First probe attempt should be allowed (started, left in-flight on purpose)
+      void service.execute(async () => 'success');
 
       // Immediately attempting another probe should fail (rate-limited)
       try {
@@ -110,7 +110,7 @@ describe('StellarCircuitBreakerService', () => {
         fail('Should have thrown');
       } catch (err) {
         expect(err).toBeInstanceOf(ServiceUnavailableException);
-        expect((err as any).response.error).toContain('probe rate-limited');
+        expect(err.response.error).toContain('probe rate-limited');
       }
 
       jest.useRealTimers();
@@ -129,15 +129,18 @@ describe('StellarCircuitBreakerService', () => {
       jest.useFakeTimers();
       jest.advanceTimersByTime(61000); // Timeout
 
-      // First probe
-      await service.execute(async () => 'success').catch(() => {});
+      // First probe fails, circuit stays half-open
+      await service.execute(async () => Promise.reject(error)).catch(() => {});
 
-      // Wait for min probe interval (5s)
-      jest.advanceTimersByTime(5000);
+      // Wait for the full timeout again (a failed probe resets lastFailureAt)
+      jest.advanceTimersByTime(61000);
 
-      // Second probe should be allowed
-      const state = service.getState();
-      expect(state.lastHalfOpenProbeAt).toBeTruthy();
+      // Second probe should be allowed (not rate-limited) and close the circuit
+      await expect(service.execute(async () => 'success')).resolves.toBe(
+        'success',
+      );
+
+      expect(service.isOpen()).toBe(false);
 
       jest.useRealTimers();
     });
@@ -193,7 +196,7 @@ describe('StellarCircuitBreakerService', () => {
       for (let i = 0; i < 20; i++) {
         try {
           await service.execute(fn);
-          congestionMonitor.recordSuccess(4500);
+          congestionMonitor.recordSuccess(5500);
         } catch {
           congestionMonitor.recordFailure();
         }
@@ -299,8 +302,8 @@ describe('StellarCircuitBreakerService', () => {
       const error = new Error('RPC failed');
 
       // Simulate congestion before circuit opens
-      for (let i = 0; i < 10; i++) {
-        congestionMonitor.recordSuccess(4000);
+      for (let i = 0; i < 40; i++) {
+        congestionMonitor.recordSuccess(6000);
       }
 
       // Trip the circuit
@@ -320,17 +323,20 @@ describe('StellarCircuitBreakerService', () => {
   });
 
   describe('Reset functionality', () => {
-    it('should reset both circuit and congestion monitor', () => {
+    it('should reset both circuit and congestion monitor', async () => {
       const error = new Error('RPC failed');
 
-      // Trip the circuit and record congestion
+      // Record enough low-error, high-latency samples to register as congestion
+      for (let i = 0; i < 20; i++) {
+        congestionMonitor.recordSuccess(6000);
+      }
+
+      // Trip the circuit
       for (let i = 0; i < 5; i++) {
         try {
           await service.execute(async () => Promise.reject(error));
         } catch {}
       }
-
-      congestionMonitor.recordSuccess(6000);
 
       expect(service.isOpen()).toBe(true);
       expect(service.getCongestionState().isCongestioned).toBe(true);

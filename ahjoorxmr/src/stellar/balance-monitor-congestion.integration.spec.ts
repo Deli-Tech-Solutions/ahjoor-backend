@@ -8,6 +8,7 @@ import { CongestionMonitorService } from './congestion-monitor.service';
 import { WebhookService, WebhookEventType } from '../webhooks/webhook.service';
 import { WinstonLogger } from '../common/logger/winston.logger';
 import { Group } from '../groups/entities/group.entity';
+import { DistributedLockService } from '../scheduler/services/distributed-lock.service';
 
 /**
  * Integration tests for BalanceMonitorService with CongestionMonitor.
@@ -26,7 +27,8 @@ describe('BalanceMonitorService - Congestion Integration', () => {
   const mockConfigService = {
     get: jest.fn((key: string, defaultValue?: any) => {
       const config: Record<string, any> = {
-        STELLAR_ISSUER_ACCOUNT: 'GISSUER123456789ABCDEFGHIJKLMNOPQRSTUVWXYZABCD',
+        STELLAR_ISSUER_ACCOUNT:
+          'GISSUER123456789ABCDEFGHIJKLMNOPQRSTUVWXYZABCD',
         STELLAR_MIN_BALANCE_ALERT_XLM: 5,
         BALANCE_CHECK_INTERVAL_MS: 900000,
         STELLAR_NETWORK: 'testnet',
@@ -61,6 +63,10 @@ describe('BalanceMonitorService - Congestion Integration', () => {
     find: jest.fn(),
   };
 
+  const mockLockService = {
+    withLock: jest.fn((_name: string, fn: () => Promise<any>) => fn()),
+  };
+
   beforeEach(async () => {
     jest.clearAllMocks();
 
@@ -84,6 +90,10 @@ describe('BalanceMonitorService - Congestion Integration', () => {
         {
           provide: getRepositoryToken(Group),
           useValue: mockGroupRepository,
+        },
+        {
+          provide: DistributedLockService,
+          useValue: mockLockService,
         },
       ],
     }).compile();
@@ -111,17 +121,6 @@ describe('BalanceMonitorService - Congestion Integration', () => {
       expect(congestionState.isCongestioned).toBe(true);
 
       mockGroupRepository.find.mockResolvedValue([]);
-
-      // Mock circuit breaker to return low balance result during congestion
-      mockCircuitBreakerService.execute.mockImplementation(async (fn) => {
-        return {
-          accountId: 'GTEST123',
-          currentBalance: '3.5000000', // Low balance
-          minimumRequired: '5',
-          isLow: true,
-          timestamp: new Date(),
-        };
-      });
 
       // Call handleBalanceCheck (we'll test the internal processBalanceResults)
       // Since we can't directly test private method, we ensure the webhook isn't called
@@ -186,9 +185,9 @@ describe('BalanceMonitorService - Congestion Integration', () => {
 
   describe('Sustained slow network profile', () => {
     it('should handle sustained high-latency-low-error-rate scenario', async () => {
-      // Simulate real-world congestion: 95% success rate, 4.5s average latency
+      // Simulate real-world congestion: 95% success rate, ~5.5s average latency
       for (let i = 0; i < 20; i++) {
-        congestionMonitor.recordSuccess(4500 + Math.random() * 500);
+        congestionMonitor.recordSuccess(5500 + Math.random() * 500);
       }
       congestionMonitor.recordFailure(); // 1 failure
 
@@ -197,7 +196,7 @@ describe('BalanceMonitorService - Congestion Integration', () => {
       // Should detect as congestion
       expect(state.isCongestioned).toBe(true);
       expect(state.errorRate).toBeLessThan(0.25);
-      expect(state.p99LatencyMs).toBeGreaterThan(4000);
+      expect(state.p99LatencyMs).toBeGreaterThan(5000);
 
       // Balance monitor should skip alerts during this state
       expect(state.isCongestioned).toBe(true);
@@ -307,8 +306,9 @@ describe('BalanceMonitorService - Congestion Integration', () => {
         ],
       }).compile();
 
-      const testMonitor =
-        module.get<CongestionMonitorService>(CongestionMonitorService);
+      const testMonitor = module.get<CongestionMonitorService>(
+        CongestionMonitorService,
+      );
 
       // Record latencies at 3500ms
       for (let i = 0; i < 15; i++) {
