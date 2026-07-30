@@ -14,6 +14,7 @@ import { User } from '../../users/entities/user.entity';
 
 export enum ContributionStatus {
   PENDING = 'PENDING',
+  ON_CHAIN_SUBMITTED = 'ON_CHAIN_SUBMITTED',
   CONFIRMED = 'CONFIRMED',
   FAILED = 'FAILED',
 }
@@ -71,6 +72,11 @@ export class Contribution {
 
   @Column({ type: 'enum', enum: ContributionStatus, default: ContributionStatus.PENDING })
   status: ContributionStatus;
+
+  /** Client-supplied idempotency key (UUID v4). Used to deduplicate concurrent retries. */
+  @Column({ type: 'varchar', length: 36, nullable: true, default: null })
+  @Index({ unique: true, where: '"idempotencyKey" IS NOT NULL' })
+  idempotencyKey: string | null;
 
   @CreateDateColumn()
   createdAt: Date;
