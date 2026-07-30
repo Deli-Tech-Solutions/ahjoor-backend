@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
 import { StellarService } from './stellar.service';
 import { StellarCircuitBreakerService } from './stellar-circuit-breaker.service';
+import { CongestionMonitorService } from './congestion-monitor.service';
 import { ContractStateGuard } from './contract-state-guard.service';
 import { BalanceMonitorService } from './balance-monitor.service';
 import { StellarAdminController } from './stellar-admin.controller';
@@ -22,6 +23,7 @@ import { DistributedLockService } from '../scheduler/services/distributed-lock.s
   controllers: [StellarAdminController],
   providers: [
     StellarService,
+    CongestionMonitorService,
     StellarCircuitBreakerService,
     ContractStateGuard,
     BalanceMonitorService,
@@ -30,9 +32,10 @@ import { DistributedLockService } from '../scheduler/services/distributed-lock.s
   ],
   exports: [
     StellarService,
+    CongestionMonitorService,
     StellarCircuitBreakerService,
     ContractStateGuard,
     BalanceMonitorService,
   ],
 })
-export class StellarModule {}
+export class StellarModule { }

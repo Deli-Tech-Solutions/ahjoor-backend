@@ -5,6 +5,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThan } from 'typeorm';
 import { DistributedLockService } from '../scheduler/services/distributed-lock.service';
 import { StellarCircuitBreakerService } from './stellar-circuit-breaker.service';
+import { CongestionMonitorService } from './congestion-monitor.service';
 import { WebhookService, WebhookEventType } from '../webhooks/webhook.service';
 import { WinstonLogger } from '../common/logger/winston.logger';
 import { Group } from '../groups/entities/group.entity';
@@ -23,6 +24,7 @@ interface AccountBalanceCheckResult {
  * the configured minimum threshold via the webhook system.
  *
  * Uses the circuit breaker to handle RPC downtime gracefully.
+ * Consults congestion state to avoid misclassifying slow reads as balance discrepancies.
  */
 @Injectable()
 export class BalanceMonitorService {
@@ -38,6 +40,7 @@ export class BalanceMonitorService {
   constructor(
     private readonly configService: ConfigService,
     private readonly circuitBreakerService: StellarCircuitBreakerService,
+    private readonly congestionMonitor: CongestionMonitorService,
     private readonly webhookService: WebhookService,
     private readonly logger_: WinstonLogger,
     @InjectRepository(Group)
@@ -205,7 +208,9 @@ export class BalanceMonitorService {
     const minBalanceXlm = parseFloat(this.minBalanceAlertXlm.toString());
 
     try {
-      const account = await (this.circuitBreakerService as any).execute(() => this.server.loadAccount(accountId));
+      const account = await (this.circuitBreakerService as any).execute(() =>
+        this.server.loadAccount(accountId),
+      );
       const balances = account.balances as any[];
 
       // Find native XLM balance
@@ -230,15 +235,31 @@ export class BalanceMonitorService {
   }
 
   /**
-   * Process balance check results and emit alerts for accounts with low balances
+   * Process balance check results and emit alerts for accounts with low balances.
+   *
+   * Key improvement: Consults congestion state to avoid misclassifying slow reads
+   * as balance discrepancies. If the network is congested but operational, we're
+   * more lenient about balance warnings since the read might be stale.
    */
   private async processBalanceResults(
     results: AccountBalanceCheckResult[],
   ): Promise<void> {
+    const congestionState = this.congestionMonitor.getState();
+    const isNetworkCongested = congestionState.isCongestioned;
+
     const currentLowBalanceAccounts = new Set<string>();
 
     for (const result of results) {
       if (result.isLow) {
+        // During congestion, be cautious about low balance alerts
+        // since the read might be stale or affected by network issues
+        if (isNetworkCongested) {
+          this.logger.warn(
+            `Skipping low balance alert for ${result.accountId} due to network congestion (P99 latency: ${congestionState.p99LatencyMs}ms)`,
+          );
+          continue;
+        }
+
         currentLowBalanceAccounts.add(result.accountId);
 
         // Only alert if this is a new low balance (wasn't low before)
@@ -264,6 +285,13 @@ export class BalanceMonitorService {
     if (currentLowBalanceAccounts.size > 0) {
       this.logger.warn(
         `${currentLowBalanceAccounts.size} account(s) have low balance: ${Array.from(currentLowBalanceAccounts).join(', ')}`,
+      );
+    }
+
+    // Log congestion state for observability
+    if (isNetworkCongested) {
+      this.logger.warn(
+        `Network congestion detected during balance check: P99=${congestionState.p99LatencyMs}ms, error rate=${(congestionState.errorRate * 100).toFixed(2)}%`,
       );
     }
   }
