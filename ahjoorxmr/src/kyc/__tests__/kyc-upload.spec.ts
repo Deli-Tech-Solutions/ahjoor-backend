@@ -11,6 +11,7 @@ import { KycDocument } from '../entities/kyc-document.entity';
 import { User } from '../../users/entities/user.entity';
 import { NotificationsService } from '../../notification/notifications.service';
 import { WinstonLogger } from '../../common/logger/winston.logger';
+import { KycProviderOrchestrator } from '../providers/kyc-provider-orchestrator.service';
 
 const mockUser = { id: 'user-uuid', email: 'test@example.com', kycStatus: null };
 
@@ -64,6 +65,12 @@ describe('KycService – file validation (issue #223)', () => {
           },
         },
         { provide: WinstonLogger, useValue: { log: jest.fn(), warn: jest.fn(), error: jest.fn() } },
+        {
+          provide: KycProviderOrchestrator,
+          useValue: {
+            submitOrReuse: jest.fn((_user, doc) => Promise.resolve(doc)),
+          },
+        },
       ],
     }).compile();
 

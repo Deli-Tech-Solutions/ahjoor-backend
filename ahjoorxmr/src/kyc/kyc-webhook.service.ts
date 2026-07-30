@@ -3,13 +3,13 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from '../users/entities/user.entity';
 import { KycDocument } from './entities/kyc-document.entity';
-import { AuditLog } from './entities/audit-log.entity';
-import { KycStatus } from './enums/kyc-status.enum';
+import { KycStatus } from './entities/kyc-status.enum';
 import { KycProviderFactory } from './providers/kyc-provider.factory';
-import { NotificationsService } from '../notification/notifications.service';
-import { NotificationType } from '../notification/enums/notification-type.enum';
-import { ConfigService } from '@nestjs/config';
 import { KycProvider } from './enums/kyc-provider.enum';
+import { NotificationsService } from '../notification/notifications.service';
+import { NotificationType } from '../notification/notification-type.enum';
+import { AuditService } from '../audit/audit.service';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class KycWebhookService {
@@ -20,22 +20,24 @@ export class KycWebhookService {
     private readonly userRepo: Repository<User>,
     @InjectRepository(KycDocument)
     private readonly kycDocRepo: Repository<KycDocument>,
-    @InjectRepository(AuditLog)
-    private readonly auditLogRepo: Repository<AuditLog>,
     private readonly providerFactory: KycProviderFactory,
     private readonly notificationsService: NotificationsService,
+    private readonly auditService: AuditService,
     private readonly config: ConfigService,
   ) {}
 
   /**
-   * Process a raw webhook body. Parses the payload, updates User.kycStatus,
-   * writes an AuditLog entry, and sends an email when appropriate.
+   * Process a raw webhook body. `provider` is the provider detected by
+   * WebhookHmacGuard from the signature header (undefined falls back to the
+   * app's configured default provider) — this matters once a case has
+   * failed over to a secondary provider, whose payload shape/status
+   * vocabulary differs from the primary.
    */
-  async processWebhook(rawBody: Buffer): Promise<void> {
-    const parser = this.providerFactory.getParser();
+  async processWebhook(rawBody: Buffer, provider?: KycProvider): Promise<void> {
+    const parser = this.providerFactory.getParser(provider);
     const parsed = parser.parse(rawBody);
 
-    const { userId, providerReferenceId, status, raw } = parsed;
+    const { userId, providerCaseId, status, raw } = parsed;
 
     const user = await this.userRepo.findOne({ where: { id: userId } });
     if (!user) {
@@ -45,40 +47,61 @@ export class KycWebhookService {
 
     const previousStatus = user.kycStatus;
 
+    const resolvedProvider =
+      provider ??
+      (this.config.get<string>('KYC_PROVIDER', KycProvider.PERSONA) as KycProvider);
+
+    // Match the case this callback belongs to, not just "latest doc for
+    // this user" — a resubmission may have created a newer, unrelated doc.
+    let doc = await this.kycDocRepo.findOne({
+      where: { userId, providerCaseId },
+      order: { uploadedAt: 'DESC' },
+    });
+    if (!doc) {
+      doc = await this.kycDocRepo.findOne({
+        where: { userId },
+        order: { uploadedAt: 'DESC' },
+      });
+    }
+    if (!doc) {
+      this.logger.warn(`KYC webhook with no matching document userId=${userId} case=${providerCaseId}`);
+      throw new NotFoundException(`No KYC document found for user ${userId}`);
+    }
+
+    const now = new Date();
+    doc.status = status;
+    doc.provider = doc.provider ?? resolvedProvider;
+    doc.providerCaseId = doc.providerCaseId ?? providerCaseId;
+    doc.providerStatus = String((raw as Record<string, unknown>)?.['status'] ?? doc.providerStatus ?? '');
+    doc.providerPayload = raw;
+    doc.lastProviderEventAt = now;
+    // A late callback resolves any stuck-pending flag.
+    doc.stuckFlaggedAt = null;
+    await this.kycDocRepo.save(doc);
+
     // Update user KYC status
     user.kycStatus = status;
     await this.userRepo.save(user);
 
-    // Upsert KycDocument record
-    const provider = this.config.get<string>('KYC_PROVIDER', KycProvider.PERSONA) as KycProvider;
-    let doc = await this.kycDocRepo.findOne({ where: { userId, providerReferenceId } });
-    if (!doc) {
-      doc = this.kycDocRepo.create({ userId, provider, providerReferenceId });
-    }
-    doc.status = status;
-    doc.providerPayload = raw;
-    await this.kycDocRepo.save(doc);
-
-    // Emit audit log
-    await this.auditLogRepo.save(
-      this.auditLogRepo.create({
-        userId,
-        eventType: 'KYC_STATUS_UPDATED',
-        metadata: {
-          previousStatus,
-          newStatus: status,
-          providerReferenceId,
-          provider,
-        },
-      }),
-    );
+    await this.auditService.createLog({
+      userId,
+      action: 'KYC_STATUS_UPDATED',
+      resource: 'kyc_document',
+      metadata: {
+        previousStatus,
+        newStatus: status,
+        providerCaseId,
+        provider: resolvedProvider,
+        documentId: doc.id,
+      },
+    });
 
     this.logger.log(
-      `KYC status updated userId=${userId} ${previousStatus} → ${status} ref=${providerReferenceId}`,
+      `KYC status updated userId=${userId} ${previousStatus} → ${status} case=${providerCaseId}`,
     );
 
     // Send email notification on terminal statuses
-    if (status === KycStatus.APPROVED || status === KycStatus.DECLINED) {
+    if (status === KycStatus.APPROVED || status === KycStatus.REJECTED) {
       await this.sendKycEmail(user, status);
     }
   }

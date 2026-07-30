@@ -13,6 +13,7 @@ import { User } from '../../users/entities/user.entity';
 import { NotificationsService } from '../../notification/notifications.service';
 import { NotificationType } from '../../notification/notification-type.enum';
 import { WinstonLogger } from '../../common/logger/winston.logger';
+import { KycProviderOrchestrator } from '../providers/kyc-provider-orchestrator.service';
 
 const mockUser = (overrides: Partial<User> = {}): User =>
   ({
@@ -65,11 +66,17 @@ describe('KycService', () => {
   let notificationsService: { notify: jest.Mock };
   let configService: { get: jest.Mock };
   let logger: { log: jest.Mock; error: jest.Mock; warn: jest.Mock };
+  let providerOrchestrator: { submitOrReuse: jest.Mock };
 
   beforeEach(async () => {
     kycDocRepo = createMockRepo();
     userRepo = createMockRepo();
     notificationsService = { notify: jest.fn().mockResolvedValue({}) };
+    providerOrchestrator = {
+      submitOrReuse: jest.fn().mockImplementation((_user, doc) =>
+        Promise.resolve({ ...doc, status: KycStatus.PENDING }),
+      ),
+    };
     configService = {
       get: jest.fn((key: string, fallback?: any) => {
         const map: Record<string, any> = {
@@ -90,6 +97,7 @@ describe('KycService', () => {
         { provide: NotificationsService, useValue: notificationsService },
         { provide: ConfigService, useValue: configService },
         { provide: WinstonLogger, useValue: logger },
+        { provide: KycProviderOrchestrator, useValue: providerOrchestrator },
       ],
     }).compile();
 
@@ -125,7 +133,33 @@ describe('KycService', () => {
       expect(notificationsService.notify).toHaveBeenCalledWith(
         expect.objectContaining({ type: NotificationType.KYC_SUBMITTED }),
       );
-      expect(result).toEqual(doc);
+      expect(providerOrchestrator.submitOrReuse).toHaveBeenCalledWith(
+        user,
+        doc,
+        file.buffer,
+      );
+      expect(result).toEqual({ ...doc, status: KycStatus.PENDING });
+    });
+
+    it('sets kycStatus from the orchestrator result (e.g. NEEDS_REVIEW when both providers fail)', async () => {
+      const file = makeFile();
+      const user = mockUser();
+      const doc = mockDoc();
+
+      userRepo.findOne.mockResolvedValue(user);
+      kycDocRepo.create.mockReturnValue(doc);
+      kycDocRepo.save.mockResolvedValue(doc);
+      userRepo.update.mockResolvedValue({});
+      providerOrchestrator.submitOrReuse.mockResolvedValue({
+        ...doc,
+        status: KycStatus.NEEDS_REVIEW,
+      });
+
+      await service.uploadDocument('user-uuid-1', file);
+
+      expect(userRepo.update).toHaveBeenCalledWith('user-uuid-1', {
+        kycStatus: KycStatus.NEEDS_REVIEW,
+      });
     });
 
     it('should upload a JPEG successfully', async () => {

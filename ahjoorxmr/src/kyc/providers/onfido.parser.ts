@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import { BadRequestException } from '@nestjs/common';
 import { KycProviderParser, ParsedWebhookPayload } from './kyc-provider.interface';
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 /** Onfido result → internal KycStatus */
 const STATUS_MAP: Record<string, KycStatus> = {
@@ -9,7 +9,7 @@ const STATUS_MAP: Record<string, KycStatus> = {
   consider: KycStatus.NEEDS_REVIEW,
   unidentified: KycStatus.NEEDS_REVIEW,
   caution: KycStatus.NEEDS_REVIEW,
-  rejected: KycStatus.DECLINED,
+  rejected: KycStatus.REJECTED,
 };
 
 export class OnfidoParser implements KycProviderParser {
@@ -43,13 +43,13 @@ export class OnfidoParser implements KycProviderParser {
     const userId = String(
       object['applicant_id'] ?? (payload['resource_type'] === 'applicant' ? object['id'] : '') ?? '',
     );
-    const providerReferenceId = String(object['id'] ?? '');
+    const providerCaseId = String(object['id'] ?? '');
 
     if (!userId) throw new BadRequestException('Onfido payload missing applicant id');
 
     return {
       userId,
-      providerReferenceId,
+      providerCaseId,
       status: STATUS_MAP[providerStatus] ?? KycStatus.NEEDS_REVIEW,
       raw: body,
     };

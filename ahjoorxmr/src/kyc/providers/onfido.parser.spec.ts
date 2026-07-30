@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 import { OnfidoParser } from './onfido.parser';
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 const SECRET = 'test-secret';
 
@@ -42,7 +42,7 @@ describe('OnfidoParser', () => {
       });
       const result = parser.parse(Buffer.from(body));
       expect(result.status).toBe(KycStatus.APPROVED);
-      expect(result.providerReferenceId).toBe('check-1');
+      expect(result.providerCaseId).toBe('check-1');
       expect(result.userId).toBe('app-1');
     });
 
@@ -53,11 +53,11 @@ describe('OnfidoParser', () => {
       expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.NEEDS_REVIEW);
     });
 
-    it('maps rejected → KycStatus.DECLINED', () => {
+    it('maps rejected → KycStatus.REJECTED', () => {
       const body = JSON.stringify({
         payload: { action: 'check.completed', object: { id: 'check-1', applicant_id: 'app-1', result: 'rejected' } },
       });
-      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.DECLINED);
+      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.REJECTED);
     });
   });
 });

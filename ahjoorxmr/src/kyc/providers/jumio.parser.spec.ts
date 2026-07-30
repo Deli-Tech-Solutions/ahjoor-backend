@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 import { JumioParser } from './jumio.parser';
-import { KycStatus } from '../enums/kyc-status.enum';
+import { KycStatus } from '../entities/kyc-status.enum';
 
 const SECRET = 'test-secret';
 
@@ -39,16 +39,16 @@ describe('JumioParser', () => {
       const result = parser.parse(Buffer.from(body));
       expect(result.status).toBe(KycStatus.APPROVED);
       expect(result.userId).toBe('user-1');
-      expect(result.providerReferenceId).toBe('ref-1');
+      expect(result.providerCaseId).toBe('ref-1');
     });
 
-    it('maps DENIED_FRAUD → KycStatus.DECLINED', () => {
+    it('maps DENIED_FRAUD → KycStatus.REJECTED', () => {
       const body = JSON.stringify({
         verificationStatus: 'DENIED_FRAUD',
         customerId: 'user-1',
         jumioIdScanReference: 'ref-1',
       });
-      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.DECLINED);
+      expect(parser.parse(Buffer.from(body)).status).toBe(KycStatus.REJECTED);
     });
 
     it('maps ERROR_NOT_READABLE_ID → KycStatus.NEEDS_REVIEW', () => {

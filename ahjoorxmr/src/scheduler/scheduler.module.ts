@@ -24,6 +24,7 @@ import { QUEUE_NAMES } from '../bullmq/queue.constants';
 import { QueueService } from '../bullmq/queue.service';
 import { ProfileCompletenessService } from '../users/services/profile-completeness.service';
 import { PenaltiesModule } from '../penalties/penalties.module';
+import { KycModule } from '../kyc/kyc.module';
 
 @Module({
   imports: [
@@ -42,6 +43,7 @@ import { PenaltiesModule } from '../penalties/penalties.module';
     GroupsModule,
     NotificationsModule,
     PenaltiesModule,
+    KycModule,
   ],
   providers: [
     SchedulerService,
