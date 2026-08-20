@@ -1,0 +1,192 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+
+export interface DeadLetterAlertConfig {
+  /** Threshold for dead-letter volume alerts (default: 10) */
+  threshold: number;
+  /** Time window in ms for counting dead-letter volume (default: 1 hour) */
+  windowMs: number;
+  /** Webhook URL for alerting (optional) */
+  webhookUrl?: string;
+}
+
+export interface DeadLetterVolumeState {
+  /** Number of dead-letter entries in the current window */
+  count: number;
+  /** Timestamp when the current window started */
+  windowStartAt: number;
+  /** Whether an alert has already been sent for this window */
+  alertSent: boolean;
+  /** Last time an alert was sent */
+  lastAlertAt: number | null;
+}
+
+/**
+ * DeadLetterAlertingService monitors dead-letter volume and triggers
+ * alerts when the volume crosses a configurable threshold within a
+ * time window. This provides early warning of systemic issues that
+ * are causing many jobs to fail simultaneously.
+ */
+@Injectable()
+export class DeadLetterAlertingService {
+  private readonly logger = new Logger(DeadLetterAlertingService.name);
+
+  private readonly threshold: number;
+  private readonly windowMs: number;
+  private readonly webhookUrl: string | undefined;
+
+  /** Per-queue dead-letter volume tracking */
+  private readonly volumeStates = new Map<string, DeadLetterVolumeState>();
+
+  constructor(private readonly configService: ConfigService) {
+    this.threshold = this.configService.get<number>(
+      'DEAD_LETTER_ALERT_THRESHOLD',
+      10,
+    );
+    this.windowMs = this.configService.get<number>(
+      'DEAD_LETTER_ALERT_WINDOW_MS',
+      60 * 60 * 1000, // 1 hour
+    );
+    this.webhookUrl = this.configService.get<string>(
+      'DEAD_LETTER_ALERT_WEBHOOK_URL',
+    );
+  }
+
+  /**
+   * Record a dead-letter entry and check if the volume threshold
+   * has been crossed. Returns true if an alert was triggered.
+   *
+   * @param queueName The queue the dead-lettered job came from
+   * @param jobName The name of the dead-lettered job
+   * @param error The error that caused the dead-letter
+   */
+  recordDeadLetter(
+    queueName: string,
+    jobName: string,
+    error: Error,
+  ): boolean {
+    const state = this.getOrCreateState(queueName);
+    const now = Date.now();
+
+    // If the window has expired, reset the counter
+    if (now - state.windowStartAt > this.windowMs) {
+      state.count = 0;
+      state.windowStartAt = now;
+      state.alertSent = false;
+    }
+
+    state.count += 1;
+
+    // Check if we've crossed the threshold and haven't alerted yet
+    if (state.count >= this.threshold && !state.alertSent) {
+      state.alertSent = true;
+      state.lastAlertAt = now;
+
+      this.logger.error(
+        `Dead-letter volume alert: queue=${queueName} ` +
+          `count=${state.count} threshold=${this.threshold} ` +
+          `windowMs=${this.windowMs} lastJob=${jobName} error="${error.message}"`,
+      );
+
+      this.sendWebhookAlert(queueName, state.count, jobName, error.message).catch(
+        () => {},
+      );
+
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Get the current dead-letter volume state for a queue.
+   * Used by admin endpoints for visibility.
+   */
+  getVolumeState(queueName: string): DeadLetterVolumeState | undefined {
+    const state = this.volumeStates.get(queueName);
+    if (!state) return undefined;
+    return { ...state };
+  }
+
+  /**
+   * Get all dead-letter volume states.
+   * Used by admin endpoints for visibility.
+   */
+  getAllVolumeStates(): Array<{ queueName: string; state: DeadLetterVolumeState }> {
+    const result: Array<{ queueName: string; state: DeadLetterVolumeState }> = [];
+    for (const [queueName, state] of this.volumeStates.entries()) {
+      result.push({ queueName, state: { ...state } });
+    }
+    return result;
+  }
+
+  /**
+   * Reset the volume state for a specific queue.
+   * Useful for manual recovery after an alert has been acknowledged.
+   */
+  resetQueue(queueName: string): void {
+    this.volumeStates.delete(queueName);
+    this.logger.log(`Reset dead-letter volume state for queue=${queueName}`);
+  }
+
+  /**
+   * Reset all volume states.
+   */
+  resetAll(): void {
+    this.volumeStates.clear();
+    this.logger.log('Reset all dead-letter volume states');
+  }
+
+  /**
+   * Get or create the volume state for a queue.
+   */
+  private getOrCreateState(queueName: string): DeadLetterVolumeState {
+    let state = this.volumeStates.get(queueName);
+    if (!state) {
+      state = {
+        count: 0,
+        windowStartAt: Date.now(),
+        alertSent: false,
+        lastAlertAt: null,
+      };
+      this.volumeStates.set(queueName, state);
+    }
+    return state;
+  }
+
+  /**
+   * Send a webhook alert when the dead-letter volume threshold is crossed.
+   */
+  private async sendWebhookAlert(
+    queueName: string,
+    count: number,
+    jobName: string,
+    errorMessage: string,
+  ): Promise<void> {
+    if (!this.webhookUrl) return;
+
+    try {
+      const { default: fetch } = await import('node-fetch').catch(() => ({
+        default: null as any,
+      }));
+      if (!fetch) return;
+
+      await fetch(this.webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'dead_letter_volume_alert',
+          queueName,
+          count,
+          threshold: this.threshold,
+          windowMs: this.windowMs,
+          lastJobName: jobName,
+          lastError: errorMessage,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+    } catch {
+      // Webhook failure is non-critical
+    }
+  }
+}

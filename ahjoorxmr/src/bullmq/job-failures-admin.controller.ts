@@ -8,7 +8,8 @@ import {
   Version,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
-import { JobFailureService, JobFailureFilter } from './job-failure.service';
+import { JobFailureService } from './job-failure.service';
+import type { JobFailureFilter } from './job-failure.service';
 
 @ApiTags('Admin – Job Failures')
 @ApiBearerAuth()
@@ -26,9 +27,22 @@ export class JobFailuresAdminController {
   @ApiQuery({ name: 'to', required: false, description: 'ISO date string' })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'isPoison', required: false, type: Boolean, description: 'Filter by poison-message status' })
   @ApiResponse({ status: 200, description: 'Paginated job failures' })
-  async getFailures(@Query() query: JobFailureFilter) {
-    const { data, total } = await this.jobFailureService.findAll(query);
+  async getFailures(@Query() query: Record<string, any>) {
+    // Convert isPoison string "true"/"false" to boolean
+    const filter: JobFailureFilter = {
+      queueName: query.queueName,
+      jobName: query.jobName,
+      from: query.from,
+      to: query.to,
+      page: query.page ? Number(query.page) : undefined,
+      limit: query.limit ? Number(query.limit) : undefined,
+      isPoison: query.isPoison !== undefined && query.isPoison !== ''
+        ? query.isPoison === 'true' || query.isPoison === true
+        : undefined,
+    };
+    const { data, total } = await this.jobFailureService.findAll(filter);
     return {
       data,
       total,

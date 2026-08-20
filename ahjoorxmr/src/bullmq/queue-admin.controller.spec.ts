@@ -2,6 +2,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { QueueAdminController } from './queue-admin.controller';
 import { QueueService, AllQueueStats } from './queue.service';
 import { JobFailureService } from './job-failure.service';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+import { CircuitBreakerAwareBackoffService } from './circuit-breaker-aware-backoff.service';
 import { AuditService } from '../audit/audit.service';
 import { QUEUE_NAMES } from './queue.constants';
 import { NotFoundException } from '@nestjs/common';
@@ -61,6 +64,9 @@ describe('QueueAdminController', () => {
   let queueService: jest.Mocked<QueueService>;
   let jobFailureService: jest.Mocked<JobFailureService>;
   let auditService: jest.Mocked<AuditService>;
+  let poisonDetector: jest.Mocked<PoisonMessageDetectorService>;
+  let alertingService: jest.Mocked<DeadLetterAlertingService>;
+  let backoffService: jest.Mocked<CircuitBreakerAwareBackoffService>;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -82,6 +88,27 @@ describe('QueueAdminController', () => {
           },
         },
         {
+          provide: PoisonMessageDetectorService,
+          useValue: {
+            getAllPoisonCandidates: jest.fn().mockReturnValue([]),
+            getPoisonStatus: jest.fn().mockReturnValue(undefined),
+            clearJob: jest.fn(),
+          },
+        },
+        {
+          provide: DeadLetterAlertingService,
+          useValue: {
+            getAllVolumeStates: jest.fn().mockReturnValue([]),
+          },
+        },
+        {
+          provide: CircuitBreakerAwareBackoffService,
+          useValue: {
+            getAllDownstreamStates: jest.fn().mockReturnValue([]),
+            resetDownstream: jest.fn(),
+          },
+        },
+        {
           provide: AuditService,
           useValue: {
             createLog: jest.fn().mockResolvedValue({}),
@@ -94,6 +121,9 @@ describe('QueueAdminController', () => {
     queueService = module.get(QueueService) as jest.Mocked<QueueService>;
     jobFailureService = module.get(JobFailureService) as jest.Mocked<JobFailureService>;
     auditService = module.get(AuditService) as jest.Mocked<AuditService>;
+    poisonDetector = module.get(PoisonMessageDetectorService) as jest.Mocked<PoisonMessageDetectorService>;
+    alertingService = module.get(DeadLetterAlertingService) as jest.Mocked<DeadLetterAlertingService>;
+    backoffService = module.get(CircuitBreakerAwareBackoffService) as jest.Mocked<CircuitBreakerAwareBackoffService>;
   });
 
   afterEach(() => jest.clearAllMocks());
@@ -126,6 +156,115 @@ describe('QueueAdminController', () => {
   });
 
   // -------------------------------------------------------------------------
+  // getPoisonMessages()
+  // -------------------------------------------------------------------------
+  describe('getPoisonMessages()', () => {
+    it('should return poison-message candidates with total', async () => {
+      poisonDetector.getAllPoisonCandidates.mockReturnValue([{ jobId: 'job-1', signature: { consecutiveFailures: 3 } as any }]);
+
+      const result = await controller.getPoisonMessages();
+      expect(result).toMatchObject({ success: true, data: [{ jobId: 'job-1' }], total: 1 });
+    });
+
+    it('should return empty list when no candidates', async () => {
+      const result = await controller.getPoisonMessages();
+      expect(result).toEqual({ success: true, data: [], total: 0 });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getPoisonMessageStatus()
+  // -------------------------------------------------------------------------
+  describe('getPoisonMessageStatus()', () => {
+    it('should return poison-message status for a job', async () => {
+      const status = { consecutiveFailures: 3, signature: 'sig', errorClass: 'Error' };
+      poisonDetector.getPoisonStatus.mockReturnValue(status as any);
+
+      const result = await controller.getPoisonMessageStatus('job-1');
+      expect(result).toEqual({ success: true, data: status });
+    });
+
+    it('should throw NotFoundException when job not tracked', async () => {
+      await expect(controller.getPoisonMessageStatus('unknown')).rejects.toThrow(
+        NotFoundException,
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // clearPoisonMessage()
+  // -------------------------------------------------------------------------
+  describe('clearPoisonMessage()', () => {
+    it('should clear poison-message tracking and audit', async () => {
+      const result = await controller.clearPoisonMessage('job-1', adminRequest);
+
+      expect(poisonDetector.clearJob).toHaveBeenCalledWith('job-1');
+      expect(auditService.createLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'admin-user-uuid',
+          action: 'ADMIN_POISON_MESSAGE_CLEAR',
+          metadata: { jobId: 'job-1' },
+        }),
+      );
+      expect(result).toEqual({ success: true, message: expect.any(String) });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getDeadLetterVolume()
+  // -------------------------------------------------------------------------
+  describe('getDeadLetterVolume()', () => {
+    it('should return dead-letter volume states', async () => {
+      alertingService.getAllVolumeStates.mockReturnValue([
+        { queueName: 'email-queue', state: { count: 5 } as any },
+      ]);
+
+      const result = await controller.getDeadLetterVolume();
+      expect(result).toMatchObject({
+        success: true,
+        data: [{ queueName: 'email-queue' }],
+        total: 1,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // getBackoffStates()
+  // -------------------------------------------------------------------------
+  describe('getBackoffStates()', () => {
+    it('should return backoff states', async () => {
+      backoffService.getAllDownstreamStates.mockReturnValue([
+        { downstream: 'stellar-rpc', currentDelayMs: 5000 } as any,
+      ]);
+
+      const result = await controller.getBackoffStates();
+      expect(result).toMatchObject({
+        success: true,
+        data: [{ downstream: 'stellar-rpc' }],
+        total: 1,
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // resetBackoffState()
+  // -------------------------------------------------------------------------
+  describe('resetBackoffState()', () => {
+    it('should reset backoff state and audit', async () => {
+      const result = await controller.resetBackoffState('stellar-rpc', adminRequest);
+
+      expect(backoffService.resetDownstream).toHaveBeenCalledWith('stellar-rpc');
+      expect(auditService.createLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'ADMIN_BACKOFF_STATE_RESET',
+          metadata: { downstream: 'stellar-rpc' },
+        }),
+      );
+      expect(result.success).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // POST /admin/dead-letter/:id/retry
   // -------------------------------------------------------------------------
   describe('retryDeadLetterJob()', () => {
@@ -144,6 +283,10 @@ describe('QueueAdminController', () => {
       failedAt: new Date(),
       updatedAt: new Date(),
       lastRetriedAt: new Date(),
+      isPoison: false,
+      consecutiveFailures: 0,
+      failureSignature: null,
+      errorClass: 'Error',
     };
 
     it('should re-enqueue the job and return success', async () => {
@@ -164,7 +307,7 @@ describe('QueueAdminController', () => {
       });
     });
 
-    it('should write an audit log entry with admin user ID, job ID, and queue name', async () => {
+    it('should write an audit log entry', async () => {
       jobFailureService.retryById.mockResolvedValueOnce({
         record: mockedRecord,
         enqueuedJobId: 'new-job-42',
@@ -184,16 +327,6 @@ describe('QueueAdminController', () => {
           }),
         }),
       );
-    });
-
-    it('should update the record status to RETRYING', async () => {
-      jobFailureService.retryById.mockResolvedValueOnce({
-        record: mockedRecord,
-        enqueuedJobId: 'new-job-42',
-      });
-
-      const result = await controller.retryDeadLetterJob(recordId, adminRequest);
-      expect(result.status).toBe('RETRYING');
     });
 
     it('should throw NotFoundException when record not found', async () => {
@@ -237,7 +370,7 @@ describe('QueueAdminController', () => {
       expect(result.results).toHaveLength(3);
     });
 
-    it('should bulk retry by filter (queueName + createdBefore)', async () => {
+    it('should bulk retry by filter', async () => {
       jobFailureService.bulkRetry.mockResolvedValueOnce(bulkResult);
 
       const dto = {

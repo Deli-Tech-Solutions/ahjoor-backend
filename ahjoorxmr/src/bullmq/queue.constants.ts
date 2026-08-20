@@ -55,3 +55,17 @@ export const RETRY_CONFIG = {
 
 // Exponential backoff delays in ms: 1s, 5s, 30s
 export const BACKOFF_DELAYS = [1_000, 5_000, 30_000];
+
+/**
+ * Downstream dependency names used for circuit-breaker-aware backoff.
+ * Jobs targeting the same downstream share a coordinated backoff state
+ * to prevent thundering herd against a recovering dependency.
+ */
+export const DOWNSTREAM_NAMES = {
+  STELLAR_RPC: 'stellar-rpc',
+  MAIL_PROVIDER: 'mail-provider',
+  PUSH_PROVIDER: 'push-provider',
+  KYC_PROVIDER: 'kyc-provider',
+} as const;
+
+export type DownstreamName = (typeof DOWNSTREAM_NAMES)[keyof typeof DOWNSTREAM_NAMES];

@@ -1,8 +1,10 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bullmq';
 import { Job, Queue } from 'bullmq';
-import { DeadLetterService } from '../../queue/dead-letter.service';
-import { QUEUE_NAMES, JOB_NAMES } from '../../queue/queue.constants';
+import { DeadLetterService } from './dead-letter.service';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+import { QUEUE_NAMES, JOB_NAMES } from './queue.constants';
 
 const makeJob = (overrides: Partial<Job> = {}): Job =>
   ({
@@ -16,6 +18,8 @@ const makeJob = (overrides: Partial<Job> = {}): Job =>
 describe('DeadLetterService', () => {
   let service: DeadLetterService;
   let deadLetterQueue: jest.Mocked<Queue>;
+  let poisonDetector: jest.Mocked<PoisonMessageDetectorService>;
+  let alertingService: jest.Mocked<DeadLetterAlertingService>;
 
   beforeEach(async () => {
     deadLetterQueue = {
@@ -23,12 +27,34 @@ describe('DeadLetterService', () => {
       name: QUEUE_NAMES.DEAD_LETTER,
     } as unknown as jest.Mocked<Queue>;
 
+    poisonDetector = {
+      recordFailure: jest.fn().mockReturnValue({
+        isPoison: false,
+        consecutiveFailures: 1,
+        threshold: 3,
+        signature: 'abc123',
+        errorClass: 'Error',
+      }),
+    } as unknown as jest.Mocked<PoisonMessageDetectorService>;
+
+    alertingService = {
+      recordDeadLetter: jest.fn().mockReturnValue(false),
+    } as unknown as jest.Mocked<DeadLetterAlertingService>;
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         DeadLetterService,
         {
           provide: getQueueToken(QUEUE_NAMES.DEAD_LETTER),
           useValue: deadLetterQueue,
+        },
+        {
+          provide: PoisonMessageDetectorService,
+          useValue: poisonDetector,
+        },
+        {
+          provide: DeadLetterAlertingService,
+          useValue: alertingService,
         },
       ],
     }).compile();
@@ -98,6 +124,51 @@ describe('DeadLetterService', () => {
       await expect(
         service.moveToDeadLetter(job, new Error('test'), QUEUE_NAMES.EMAIL),
       ).rejects.toThrow('Redis connection lost');
+    });
+
+    it('should return poison_message reason when poison message detected', async () => {
+      poisonDetector.recordFailure.mockReturnValue({
+        isPoison: true,
+        consecutiveFailures: 3,
+        threshold: 3,
+        signature: 'poison-sig',
+        errorClass: 'Error',
+      });
+
+      const job = makeJob();
+      const result = await service.moveToDeadLetter(
+        job,
+        new Error('Malformed payload'),
+        QUEUE_NAMES.EMAIL,
+      );
+
+      expect(result.reason).toBe('poison_message');
+      expect(result.consecutiveFailures).toBe(3);
+
+      const [, payload] = deadLetterQueue.add.mock.calls[0];
+      expect(payload.poisonMessage).toMatchObject({
+        detected: true,
+        consecutiveFailures: 3,
+        threshold: 3,
+      });
+    });
+
+    it('should trigger alerting service and report alertTriggered', async () => {
+      alertingService.recordDeadLetter.mockReturnValue(true);
+
+      const job = makeJob();
+      const result = await service.moveToDeadLetter(
+        job,
+        new Error('test'),
+        QUEUE_NAMES.EMAIL,
+      );
+
+      expect(alertingService.recordDeadLetter).toHaveBeenCalledWith(
+        QUEUE_NAMES.EMAIL,
+        JOB_NAMES.SEND_EMAIL,
+        expect.any(Error),
+      );
+      expect(result.alertTriggered).toBe(true);
     });
   });
 });
