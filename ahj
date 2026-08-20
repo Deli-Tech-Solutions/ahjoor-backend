@@ -1,0 +1,472 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository, Between, LessThan } from 'typeorm';
+import { ConfigService } from '@nestjs/config';
+import { createHmac } from 'crypto';
+import { AuditLog } from './entities/audit-log.entity';
+import { AuditLogQueryDto } from './dto/audit-log-query.dto';
+import {
+  PaginatedAuditLogResponseDto,
+  AuditLogResponseDto,
+} from './dto/audit-log-response.dto';
+import { UseReadReplica } from '../common/decorators/read-replica.decorator';
+import { AuditExportQueryDto } from './dto/audit-export-query.dto';
+import {
+  computeRowHash,
+  CHAIN_PARTITION_GLOBAL,
+} from './audit-chain-hash';
+
+/**
+ * Result returned by the integrity verification walk.
+ */
+export interface AuditIntegrityReport {
+  ok: boolean;
+  totalRows: number;
+  verifiedRows: number;
+  firstBrokenLink: {
+    index: number;
+    id: string;
+    expectedHash: string;
+    actualHash: string;
+    reason: 'MISMATCH' | 'MISSING_HASH' | 'DUPLICATE_SEQUENCE';
+  } | null;
+  chainId: string | null;
+  chainPartition: string;
+  anchorVerified: boolean;
+  anchorMessage: string;
+  checkedAt: string;
+}
+
+@Injectable()
+export class AuditService {
+  private readonly logger = new Logger(AuditService.name);
+
+  constructor(
+    @InjectRepository(AuditLog)
+    private readonly auditLogRepository: Repository<AuditLog>,
+    private readonly configService: ConfigService,
+    private readonly dataSource: DataSource,
+  ) {}
+
+  /**
+   * Append a new audit log row with tamper-evidence.
+   *
+   * The new row's `hash` is computed as SHA-256 of its own canonical content
+   * plus the previous row's hash (per chain partition). To protect against
+   * concurrent writers corrupting the chain sequence, the read-last-hash and
+   * insert are performed inside a transaction that takes a PostgreSQL
+   * advisory transaction lock scoped to the chain.
+   *
+   * @param data - audit log data (without hash/prevHash/chainId — these are computed)
+   */
+  async createLog(data: Partial<AuditLog>): Promise<AuditLog> {
+    return this.dataSource.transaction(async (manager) => {
+      const repo = manager.getRepository(AuditLog);
+      const chainPartition = data.chainPartition || CHAIN_PARTITION_GLOBAL;
+
+      // Serialize concurrent writers for the same chain so we cannot create
+      // two rows with the same prevHash (double-spend style chain corruption).
+      const lockKey = `audit_chain_${chainPartition}`;
+      // Hash the key so it fits in a bigint.
+      const lockNum = this.chainLockBigInt(lockKey);
+      await manager.query(
+        `SELECT pg_advisory_xact_lock(${lockNum})`,
+      );
+
+      // 1. Resolve chainId (first row creates a new chain).
+      let chainId = data.chainId;
+      if (!chainId) {
+        const first = await repo
+          .createQueryBuilder('al')
+          .select('al.chainId', 'chainId')
+          .where('al.chainPartition = :p', { p: chainPartition })
+          .orderBy('al.timestamp', 'ASC')
+          .addOrderBy('al.id', 'ASC')
+          .getRawOne();
+        chainId = first?.chainId;
+      }
+
+      // 2. Find previous row's hash.
+      const prev = await repo
+        .createQueryBuilder('al')
+        .where('al.chainPartition = :p', { p: chainPartition })
+        .andWhere(chainId ? 'al.chainId = :chainId' : '1=1', {
+          chainId,
+        })
+        .orderBy('al.timestamp', 'DESC')
+        .addOrderBy('al.id', 'DESC')
+        .getOne();
+
+      const prevHash = prev?.hash ?? '';
+      const cid = chainId ?? crypto.randomUUID();
+
+      // 3. Insert the row first (to get the id/timestamp), then compute hash.
+      const log = repo.create({
+        ...data,
+        chainId: cid,
+        chainPartition,
+        chainVersion: data.chainVersion ?? 1,
+        prevHash,
+        hash: '', // placeholder — computed and updated below
+      });
+      const saved = await repo.save(log);
+
+      // 4. Compute the row hash (canonical content + prevHash) and persist.
+      const timestampIso = this.toIso(saved.timestamp);
+      const hash = computeRowHash({
+        id: saved.id,
+        userId: saved.userId ?? null,
+        action: saved.action ?? '',
+        resource: saved.resource ?? '',
+        metadata: saved.metadata ?? null,
+        timestamp: timestampIso,
+        ipAddress: saved.ipAddress ?? null,
+        userAgent: saved.userAgent ?? null,
+        requestPayload: saved.requestPayload ?? null,
+        prevHash,
+        chainId: cid,
+        chainPartition,
+        chainVersion: saved.chainVersion ?? 1,
+      });
+
+      saved.hash = hash;
+      saved.prevHash = prevHash;
+      await repo.update(saved.id, { hash });
+
+      return saved;
+    });
+  }
+
+  /**
+   * Record an external anchor reference on a row (used by AuditAnchorService).
+   */
+  async recordAnchorReference(
+    id: string,
+    anchorReference: string,
+  ): Promise<void> {
+    await this.auditLogRepository.update(id, { anchorReference });
+  }
+
+  /**
+   * Integrity-verification job/endpoint.
+   *
+   * Walks the chain from the first row forward, recomputing each row's hash
+   * from its canonical content + previous row's hash, and reports the first
+   * broken link (if any). Also checks that the anchor (if any) matches the
+   * current chain head.
+   *
+   * @param options.chainId        - restrict to a specific chain (default: global chain)
+   * @param options.chainPartition - partition key (default: 'GLOBAL')
+   * @param options.limit          - cap the number of rows walked (default 100000)
+   */
+  async verifyIntegrity(options?: {
+    chainId?: string;
+    chainPartition?: string;
+    limit?: number;
+  }): Promise<AuditIntegrityReport> {
+    const chainPartition = options?.chainPartition || CHAIN_PARTITION_GLOBAL;
+    const limit = options?.limit ?? 100000;
+
+    // Resolve the chain if not provided
+    let chainId = options?.chainId;
+    if (!chainId) {
+      const first = await this.auditLogRepository
+        .createQueryBuilder('al')
+        .select('al.chainId', 'chainId')
+        .where('al.chainPartition = :p', { p: chainPartition })
+        .orderBy('al.timestamp', 'ASC')
+        .addOrderBy('al.id', 'ASC')
+        .getRawOne();
+      chainId = first?.chainId;
+    }
+
+    if (!chainId) {
+      return {
+        ok: true,
+        totalRows: 0,
+        verifiedRows: 0,
+        firstBrokenLink: null,
+        chainId: null,
+        chainPartition,
+        anchorVerified: true,
+        anchorMessage: 'Empty chain — nothing to verify',
+        checkedAt: new Date().toISOString(),
+      };
+    }
+
+    // Fetch rows in chain order.
+    const rows = await this.auditLogRepository.find({
+      where: { chainId, chainPartition },
+      order: { timestamp: 'ASC', id: 'ASC' },
+      take: limit,
+    });
+
+    let prevHash = '';
+    let verifiedCount = 0;
+    let firstBroken: AuditIntegrityReport['firstBrokenLink'] = null;
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+
+      // 1. First-row chain-link check
+      if (i === 0 && (row.prevHash ?? '') !== '') {
+        firstBroken = {
+          index: i,
+          id: row.id,
+          expectedHash: '',
+          actualHash: row.prevHash,
+          reason: 'MISMATCH',
+        };
+        break;
+      }
+
+      // 2. prevHash continuity check
+      if (row.prevHash !== prevHash) {
+        firstBroken = {
+          index: i,
+          id: row.id,
+          expectedHash: prevHash,
+          actualHash: row.prevHash,
+          reason: 'MISMATCH',
+        };
+        break;
+      }
+
+      // 3. Recompute hash and compare
+      const expected = computeRowHash({
+        id: row.id,
+        userId: row.userId ?? null,
+        action: row.action ?? '',
+        resource: row.resource ?? '',
+        metadata: row.metadata ?? null,
+        timestamp: this.toIso(row.timestamp),
+        ipAddress: row.ipAddress ?? null,
+        userAgent: row.userAgent ?? null,
+        requestPayload: row.requestPayload ?? null,
+        prevHash: row.prevHash ?? '',
+        chainId: row.chainId ?? '',
+        chainPartition: row.chainPartition ?? chainPartition,
+        chainVersion: row.chainVersion ?? 1,
+      });
+
+      if (row.hash !== expected) {
+        firstBroken = {
+          index: i,
+          id: row.id,
+          expectedHash: expected,
+          actualHash: row.hash ?? '(missing)',
+          reason: 'MISMATCH',
+        };
+        break;
+      }
+
+      verifiedCount++;
+      prevHash = row.hash;
+    }
+
+    const ok = firstBroken === null;
+
+    // 4. Anchor check (compare latest anchor to current head)
+    let anchorOk = true;
+    let anchorMessage = 'No anchor configured for this chain';
+    if (ok && rows.length > 0) {
+      const head = rows[rows.length - 1];
+      const latestAnchor = await this.auditLogRepository.manager
+        .getRepository(require('./entities/audit-anchor.entity').AuditAnchor)
+        .createQueryBuilder('anchor')
+        .where('anchor.chainId = :chainId', { chainId })
+        .andWhere('anchor.chainPartition = :chainPartition', {
+          chainPartition,
+        })
+        .orderBy('anchor.sequence', 'DESC')
+        .getOne();
+
+      if (latestAnchor) {
+        anchorOk = latestAnchor.chainHeadHash === head.hash;
+        anchorMessage = anchorOk
+          ? `Anchor (${latestAnchor.anchorType}) matches chain head`
+          : `Anchor mismatch: stored ${latestAnchor.chainHeadHash} != actual head ${head.hash}`;
+      }
+    }
+
+    return {
+      ok: ok && anchorOk,
+      totalRows: rows.length,
+      verifiedRows: verifiedCount,
+      firstBrokenLink: firstBroken,
+      chainId,
+      chainPartition,
+      anchorVerified: anchorOk,
+      anchorMessage,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  async findAll(
+    query: AuditLogQueryDto,
+  ): Promise<PaginatedAuditLogResponseDto> {
+    const {
+      userId,
+      action,
+      resource,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 20,
+    } = query;
+
+    const whereConditions: any = {};
+
+    if (userId) {
+      whereConditions.userId = userId;
+    }
+
+    if (action) {
+      whereConditions.action = action;
+    }
+
+    if (resource) {
+      whereConditions.resource = resource;
+    }
+
+    if (startDate && endDate) {
+      whereConditions.timestamp = Between(
+        new Date(startDate),
+        new Date(endDate),
+      );
+    } else if (startDate) {
+      whereConditions.timestamp = Between(new Date(startDate), new Date());
+    }
+
+    const skip = (page - 1) * limit;
+
+    const [logs, total] = await this.auditLogRepository.findAndCount({
+      where: whereConditions,
+      order: { timestamp: 'DESC' },
+      skip,
+      take: limit, // always apply LIMIT so idx_audit_user_created is exercised
+    });
+
+    return {
+      data: logs.map((log) => AuditLogResponseDto.fromEntity(log)),
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  async archiveOldLogs(daysOld: number = 365): Promise<number> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+
+    try {
+      const result = await this.auditLogRepository.delete({
+        timestamp: LessThan(cutoffDate),
+      });
+
+      const count = result.affected || 0;
+      this.logger.log(
+        `Archived ${count} audit logs older than ${daysOld} days`,
+      );
+
+      return count;
+    } catch (error) {
+      this.logger.error('Failed to archive old logs', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Returns the last 100 impersonation events for compliance review.
+   */
+  async findImpersonationLogs(): Promise<AuditLog[]> {
+    return this.auditLogRepository.find({
+      where: { action: 'IMPERSONATION_REQUEST' },
+      order: { timestamp: 'DESC' },
+      take: 100,
+    });
+  }
+
+  async exportAuditLogs(
+    query: AuditExportQueryDto,
+  ): Promise<{ logs: AuditLog[]; count: number }> {
+    const whereConditions: any = {};
+
+    if (query.from && query.to) {
+      whereConditions.timestamp = Between(new Date(query.from), new Date(query.to));
+    } else if (query.from) {
+      whereConditions.timestamp = Between(new Date(query.from), new Date());
+    }
+
+    if (query.eventTypes && query.eventTypes.length > 0) {
+      whereConditions.action = query.eventTypes;
+    }
+
+    const [logs, count] = await this.auditLogRepository.findAndCount({
+      where: whereConditions,
+      order: { timestamp: 'DESC' },
+      take: 100000,
+    });
+
+    return { logs, count };
+  }
+
+  redactPii(log: AuditLog): any {
+    const redacted = { ...log };
+    if (redacted.metadata?.email) {
+      redacted.metadata.email = '[REDACTED]';
+    }
+    if (redacted.metadata?.walletAddress) {
+      redacted.metadata.walletAddress = '[REDACTED]';
+    }
+    return redacted;
+  }
+
+  generateHmacSignature(data: string): string {
+    const secret = this.configService.get<string>('PII_HMAC_SECRET');
+    return createHmac('sha256', secret).update(data).digest('hex');
+  }
+
+  formatAsJson(logs: AuditLog[], includePii: boolean): string {
+    const data = includePii ? logs : logs.map((log) => this.redactPii(log));
+    return JSON.stringify(data, null, 2);
+  }
+
+  formatAsCsv(logs: AuditLog[], includePii: boolean): string {
+    if (logs.length === 0) return 'id,userId,action,resource,timestamp,ipAddress\n';
+
+    const headers = 'id,userId,action,resource,timestamp,ipAddress\n';
+    const rows = logs.map((log) => {
+      const processed = includePii ? log : this.redactPii(log);
+      return `${processed.id},${processed.userId || ''},${processed.action},${processed.resource},${processed.timestamp.toISOString()},${processed.ipAddress || ''}`;
+    });
+
+    return headers + rows.join('\n');
+  }
+
+  /**
+   * Convert a Date (or any value) to an ISO-8601 string for hashing.
+   */
+  private toIso(value: Date | string | undefined | null): string {
+    if (value instanceof Date) return value.toISOString();
+    if (typeof value === 'string') {
+      const d = new Date(value);
+      return isNaN(d.getTime()) ? value : d.toISOString();
+    }
+    return new Date().toISOString();
+  }
+
+  /**
+   * Convert a chain lock name to a stable positive bigint for
+   * pg_advisory_xact_lock.
+   */
+  private chainLockBigInt(lockKey: string): string {
+    let hash = 0;
+    for (let i = 0; i < lockKey.length; i++) {
+      hash = (hash * 31 + lockKey.charCodeAt(i)) >>> 0;
+    }
+    // Postgres advisory locks accept positive bigint; use two-int form to be safe.
+    return String(hash % 2147483647);
+  }
+}
