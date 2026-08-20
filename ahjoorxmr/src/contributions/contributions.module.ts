@@ -19,6 +19,7 @@ import { NotificationsModule } from '../notification/notifications.module';
 import { WebhookModule } from '../webhooks/webhook.module';
 import { QueueModule } from '../bullmq/queue.module';
 import { CommonModule } from '../common/common.module';
+import { FxModule } from '../fx/fx.module';
 
 /**
  * ContributionsModule manages member contributions in a group-based ROSCA system.
@@ -36,6 +37,7 @@ import { CommonModule } from '../common/common.module';
     forwardRef(() => WebhookModule),
     forwardRef(() => QueueModule),
     CommonModule,
+    FxModule,
   ],
   controllers: [ContributionsController],
   providers: [ContributionsService, ContributionReconciliationService, ReceiptService, WinstonLogger, ApiKeyGuard, JwtAuthGuard],
