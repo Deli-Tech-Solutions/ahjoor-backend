@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
 import { RedisModule } from '../common/redis/redis.module';
+import { RedisService } from '../common/redis/redis.service';
 import { RedisThrottlerStorageService } from './redis-throttler-storage.service';
 import { getThrottlerConfig } from './throttler.config';
 import { TrustedIpService } from './services/trusted-ip.service';
@@ -11,21 +12,24 @@ import { RateLimitAdminController } from './controllers/rate-limit-admin.control
 import { RateLimitExampleController } from './controllers/rate-limit-example.controller';
 
 /**
- * Custom throttler module with Redis storage and advanced features
- * - Redis-based distributed rate limiting
- * - Trusted IP bypass mechanism
- * - IP blocking for repeated violations
- * - Configurable rate limits per endpoint
- * - Admin API for managing blocked/trusted IPs
- * - Example endpoints demonstrating usage
+ * Custom throttler module with Redis storage and advanced features.
+ * Storage is wired as a constructed instance via forRootAsync so Nest uses the
+ * DI-backed Redis client (passing the class token alone is not enough).
  */
 @Module({
   imports: [
-    ThrottlerModule.forRoot({
-      ...getThrottlerConfig(),
-      storage: RedisThrottlerStorageService,
-    }),
     RedisModule,
+    ThrottlerModule.forRootAsync({
+      imports: [RedisModule],
+      inject: [RedisService],
+      useFactory: (redisService: RedisService) => {
+        const storage = new RedisThrottlerStorageService(redisService);
+        return {
+          ...getThrottlerConfig(),
+          storage,
+        };
+      },
+    }),
   ],
   controllers: [RateLimitAdminController, RateLimitExampleController],
   providers: [
