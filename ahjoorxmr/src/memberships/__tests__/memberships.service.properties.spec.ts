@@ -1,12 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository, ObjectLiteral } from 'typeorm';
+import { DataSource, Repository, ObjectLiteral } from 'typeorm';
 import * as fc from 'fast-check';
 import { MembershipsService } from '../memberships.service';
 import { Membership } from '../entities/membership.entity';
 import { Group } from '../../groups/entities/group.entity';
 import { WinstonLogger } from '../../common/logger/winston.logger';
 import { MembershipStatus } from '../entities/membership-status.enum';
+import { NotificationsService } from '../../notification/notifications.service';
+import { WaitlistService } from '../../waitlist/waitlist.service';
+import { MemberTrustScore } from '../../trust-score/entities/member-trust-score.entity';
 
 /**
  * Custom Arbitraries for Property-Based Testing
@@ -119,6 +122,22 @@ describe('MembershipsService Property-Based Tests', () => {
         {
           provide: WinstonLogger,
           useValue: logger,
+        },
+        {
+          provide: NotificationsService,
+          useValue: { notify: jest.fn().mockResolvedValue({}) },
+        },
+        {
+          provide: WaitlistService,
+          useValue: { admitFromWaitlist: jest.fn().mockResolvedValue([]) },
+        },
+        {
+          provide: getRepositoryToken(MemberTrustScore),
+          useValue: createMockRepository(),
+        },
+        {
+          provide: DataSource,
+          useValue: { transaction: jest.fn(async (cb) => cb({})) },
         },
       ],
     }).compile();
