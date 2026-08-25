@@ -32,6 +32,14 @@ export class MemberTrustScore extends BaseEntity {
   @Column({ type: 'decimal', precision: 5, scale: 2, default: 0 })
   score: number;
 
+  /** Confidence that the member's group history contains repeated-cohort activity. */
+  @Column({ type: 'decimal', precision: 5, scale: 4, default: 0 })
+  antiGamingConfidence: number;
+
+  /** Advisory flag for manual admin review; it never changes the trust score. */
+  @Column({ type: 'boolean', default: false })
+  antiGamingFlagged: boolean;
+
   /** Total number of distinct groups the user has participated in. */
   @Column({ type: 'int', default: 0 })
   totalGroupsParticipated: number;

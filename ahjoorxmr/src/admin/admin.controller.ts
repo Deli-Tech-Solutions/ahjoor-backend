@@ -27,6 +27,8 @@ import { MaintenanceModeService } from '../common/services/maintenance-mode.serv
 import { CreateApiKeyDto, CreateApiKeyResponseDto, ApiKeyResponseDto } from '../api-keys/dto/api-key.dto';
 import { SetMaintenanceModeDto, MaintenanceStatusResponseDto, MaintenanceModeResponseDto } from '../common/dto/maintenance-mode.dto';
 import { AuditLog } from '../audit/entities/audit-log.entity';
+import { TrustScoreService } from '../trust-score/trust-score.service';
+import { MemberTrustScore } from '../trust-score/entities/member-trust-score.entity';
 
 @ApiTags('Admin')
 @ApiBearerAuth('JWT-auth')
@@ -39,6 +41,7 @@ export class AdminController {
     private readonly configService: ConfigService,
     private readonly auditService: AuditService,
     private readonly maintenanceModeService: MaintenanceModeService,
+    private readonly trustScoreService: TrustScoreService,
   ) {}
 
   @Get()
@@ -53,6 +56,7 @@ export class AdminController {
         { method: 'DELETE', path: '/admin/api-keys/:id',           description: 'Revoke API key' },
         { method: 'POST',   path: '/admin/impersonate/:userId',    description: 'Issue impersonation token' },
         { method: 'GET',    path: '/admin/impersonation/audit',    description: 'Impersonation audit log' },
+        { method: 'GET',    path: '/admin/trust-score/reviews',   description: 'List trust-score anti-gaming review flags' },
       ],
     };
   }
@@ -158,6 +162,13 @@ export class AdminController {
   @ApiResponse({ status: 200, description: 'Impersonation audit log entries' })
   async getImpersonationAudit(): Promise<AuditLog[]> {
     return this.auditService.findImpersonationLogs();
+  }
+
+  @Get('trust-score/reviews')
+  @ApiOperation({ summary: 'List trust-score anti-gaming review flags' })
+  @ApiResponse({ status: 200, description: 'Trust scores flagged for manual review' })
+  async listTrustScoreReviews(): Promise<MemberTrustScore[]> {
+    return this.trustScoreService.listFlaggedScores();
   }
 
   // ─── Maintenance Mode ───────────────────────────────────────────────────

@@ -6,11 +6,13 @@ import { AdminController } from './admin.controller';
 import { ApiKeysModule } from '../api-keys/api-keys.module';
 import { AuditModule } from '../audit/audit.module';
 import { BlockImpersonationGuard } from './block-impersonation.guard';
+import { TrustScoreModule } from '../trust-score/trust-score.module';
 
 @Module({
   imports: [
     ApiKeysModule,
     AuditModule,
+    TrustScoreModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
