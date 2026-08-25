@@ -17,6 +17,7 @@ export enum WebhookDeliveryStatus {
 
 @Entity('webhook_deliveries')
 @Index(['webhookId', 'attemptedAt'])
+@Index(['webhookId', 'eventId'], { unique: true })
 export class WebhookDelivery {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -28,6 +29,9 @@ export class WebhookDelivery {
   @ManyToOne(() => Webhook, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'webhookId' })
   webhook: Webhook;
+
+  @Column({ type: 'varchar', length: 128 })
+  eventId: string;
 
   @Column({ type: 'varchar', length: 50 })
   status: WebhookDeliveryStatus;

@@ -6,6 +6,7 @@ export class CreateWebhookDeliveriesTable1745300000000 implements MigrationInter
       CREATE TABLE "webhook_deliveries" (
         "id" uuid NOT NULL DEFAULT uuid_generate_v4(),
         "webhookId" uuid NOT NULL,
+        "eventId" varchar(128) NOT NULL,
         "status" varchar(50) NOT NULL DEFAULT 'PENDING',
         "responseCode" integer,
         "responseBody" varchar(1024),
@@ -13,6 +14,7 @@ export class CreateWebhookDeliveriesTable1745300000000 implements MigrationInter
         "attemptNumber" integer NOT NULL DEFAULT 1,
         "attemptedAt" TIMESTAMP NOT NULL DEFAULT now(),
         CONSTRAINT "PK_webhook_deliveries" PRIMARY KEY ("id"),
+        CONSTRAINT "UQ_webhook_deliveries_webhookId_eventId" UNIQUE ("webhookId", "eventId"),
         CONSTRAINT "FK_webhook_deliveries_webhook"
           FOREIGN KEY ("webhookId") REFERENCES "webhooks"("id") ON DELETE CASCADE
       )

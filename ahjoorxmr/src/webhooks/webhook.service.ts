@@ -8,7 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { createHmac, randomBytes } from 'crypto';
+import { createHash, createHmac, randomBytes } from 'crypto';
 import axios from 'axios';
 import { Webhook } from './entities/webhook.entity';
 import {
@@ -67,7 +67,11 @@ export class WebhookService {
     } as ContributionVerifiedPayload);
   }
 
-  async dispatchEvent(event: WebhookEventType, data: unknown): Promise<void> {
+  async dispatchEvent(
+    event: WebhookEventType,
+    data: unknown,
+    eventId?: string,
+  ): Promise<void> {
     const webhooks = await this.webhookRepository.find({
       where: { isActive: true },
     });
@@ -77,6 +81,7 @@ export class WebhookService {
 
     const payload: WebhookPayload = {
       event,
+      event_id: eventId ?? this.createEventId(event, data),
       timestamp: new Date().toISOString(),
       data,
     };
@@ -111,24 +116,46 @@ export class WebhookService {
     deliveryTime: number;
   }> {
     const start = Date.now();
-    const payloadString = JSON.stringify(payload);
+    const eventId = payload.event_id ?? this.createEventId(payload.event, payload.data);
+    const deliveryPayload: WebhookPayload = { ...payload, event_id: eventId };
+    const payloadString = JSON.stringify(deliveryPayload);
     const signature = this.generateSignature(payloadString, secret);
 
-    let delivery = this.deliveryRepository.create({
-      webhookId,
-      status: WebhookDeliveryStatus.PENDING,
-      payload: payloadString,
-      attemptNumber,
-      responseCode: null,
-      responseBody: null,
+    let delivery = await this.deliveryRepository.findOne({
+      where: { webhookId, eventId },
     });
+
+    if (delivery?.status === WebhookDeliveryStatus.SUCCESS) {
+      return {
+        statusCode: delivery.responseCode ?? 200,
+        responseBody: delivery.responseBody ?? '',
+        deliveryTime: 0,
+      };
+    }
+
+    delivery = delivery
+      ? Object.assign(delivery, {
+          status: WebhookDeliveryStatus.PENDING,
+          payload: payloadString,
+          attemptNumber,
+        })
+      : this.deliveryRepository.create({
+          webhookId,
+          eventId,
+          status: WebhookDeliveryStatus.PENDING,
+          payload: payloadString,
+          attemptNumber,
+          responseCode: null,
+          responseBody: null,
+        });
     delivery = await this.deliveryRepository.save(delivery);
 
     try {
-      const response = await axios.post(url, payload, {
+      const response = await axios.post(url, deliveryPayload, {
         headers: {
           'Content-Type': 'application/json',
           'X-Ahjoor-Signature': signature,
+          'X-Ahjoor-Event-Id': eventId,
           'User-Agent': 'Ahjoorxmr-Webhook/1.0',
         },
         timeout: 10_000,
@@ -261,5 +288,22 @@ export class WebhookService {
     });
     if (result.affected === 0)
       throw new NotFoundException('Webhook not found or unauthorized');
+  }
+
+  private createEventId(event: string, data: unknown): string {
+    return createHash('sha256')
+      .update(`${event}:${this.stableSerialize(data)}`)
+      .digest('hex');
+  }
+
+  private stableSerialize(value: unknown): string {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value);
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stableSerialize(item)).join(',')}]`;
+    }
+    return `{${Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${this.stableSerialize((value as Record<string, unknown>)[key])}`)
+      .join(',')}}`;
   }
 }
