@@ -23,6 +23,8 @@ import { WebhookService } from '../webhooks/webhook.service';
 import { QueueService } from '../bullmq/queue.service';
 import { GroupMaintenanceMixin } from '../common/services/group-maintenance.mixin';
 import { RedisService } from '../common/redis/redis.service';
+import { FxService } from '../fx/fx.service';
+import { LockedFxRate } from '../fx/fx.types';
 
 /** TTL for the in-flight Redis lock (seconds). Must exceed the longest expected Stellar submission. */
 const IN_FLIGHT_LOCK_TTL_S = 60;
@@ -51,6 +53,7 @@ export class ContributionsService {
     private readonly queueService: QueueService,
     private readonly groupMaintenanceMixin: GroupMaintenanceMixin,
     private readonly redisService: RedisService,
+    private readonly fxService: FxService,
   ) {}
 
   /**
@@ -177,7 +180,10 @@ export class ContributionsService {
         throw new BadRequestException('Contributions can only be made for the current round');
       }
 
-      // ── 4. Stellar verification ──
+      // ── 4. Stellar verification + FX rate locking ──
+      let lockedRate: LockedFxRate | null = null;
+      let normalizedAmount: string | null = null;
+
       const shouldVerify = this.configService.get<boolean>('VERIFY_CONTRIBUTIONS', true);
       if (shouldVerify) {
         const isValid = await this.stellarService.verifyContributionForGroup(
@@ -192,21 +198,36 @@ export class ContributionsService {
 
         try {
           const txDetails = await this.stellarService.getTransactionAmount(transactionHash);
-          const requiredAsset = (group.assetCode ?? 'XLM').toUpperCase();
           const txAsset = txDetails.assetCode.toUpperCase();
-          if (txAsset !== requiredAsset) {
-            throw new BadRequestException(
-              `Transaction asset (${txAsset}) does not match group required asset (${requiredAsset})`,
-            );
-          }
-          const txAmountNum = Number(txDetails.amount);
+
+          // Determine the contribution asset (what the member actually paid in).
+          const contributionAsset = this.fxService.getContributionAsset(
+            group,
+            txAsset,
+            txDetails.assetIssuer,
+          );
+
+          // Capture and lock the FX rate at submission time.
+          lockedRate = await this.fxService.lockRate(group, contributionAsset);
+
+          // Normalize the contribution amount to the group's unit of account.
+          const normalized = await this.fxService.normalizeToUnitOfAccount(
+            group,
+            txDetails.amount,
+            contributionAsset,
+            lockedRate,
+          );
+          normalizedAmount = normalized.normalized;
+
+          // Verify the normalized amount meets the required contribution.
+          const normalizedNum = Number(normalizedAmount);
           const requiredAmountNum = Number(group.contributionAmount);
-          if (isNaN(txAmountNum) || isNaN(requiredAmountNum)) {
+          if (isNaN(normalizedNum) || isNaN(requiredAmountNum)) {
             throw new BadRequestException('Unable to parse transaction amount for verification');
           }
-          if (txAmountNum < requiredAmountNum) {
+          if (normalizedNum < requiredAmountNum) {
             throw new BadRequestException(
-              `Transaction amount (${txDetails.amount}) is less than required contribution amount (${group.contributionAmount})`,
+              `Contribution value (${normalizedAmount} ${group.unitOfAccountAssetCode ?? group.assetCode ?? 'XLM'}) is less than required contribution amount (${group.contributionAmount})`,
             );
           }
         } catch (amountError) {
@@ -237,6 +258,13 @@ export class ContributionsService {
           timestamp: createContributionDto.timestamp,
           assetCode: group.assetCode ?? 'XLM',
           assetIssuer: group.assetIssuer ?? null,
+          unitOfAccountAssetCode: group.unitOfAccountAssetCode ?? group.assetCode ?? 'XLM',
+          unitOfAccountAssetIssuer: group.unitOfAccountAssetIssuer ?? group.assetIssuer ?? null,
+          fxRate: lockedRate?.rate ?? '1',
+          fxRateCapturedAt: lockedRate ? new Date(lockedRate.capturedAt) : null,
+          fxRateExpiresAt: lockedRate ? new Date(lockedRate.expiresAt) : null,
+          fxToleranceBps: lockedRate?.toleranceBps ?? group.fxToleranceBps ?? 200,
+          normalizedAmount,
           status: ContributionStatus.PENDING,
           idempotencyKey: idempotencyKey ?? null,
         })

@@ -25,6 +25,8 @@ import { AnnouncementsController } from './announcements.controller';
 import { AuditModule } from '../audit/audit.module';
 import { GroupTemplatesService } from './group-templates.service';
 import { GroupTemplatesController } from './group-templates.controller';
+import { Contribution } from '../contributions/entities/contribution.entity';
+import { FxModule } from '../fx/fx.module';
 
 /**
  * GroupsModule manages ROSCA group entities in the database.
@@ -33,12 +35,13 @@ import { GroupTemplatesController } from './group-templates.controller';
  */
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Group, GroupTemplate, Membership, PayoutTransaction, GroupInvite, User, Announcement]),
+    TypeOrmModule.forFeature([Group, GroupTemplate, Membership, PayoutTransaction, GroupInvite, User, Announcement, Contribution]),
     NotificationsModule,
     StellarModule,
     QueueModule,
     MailModule,
     AuditModule,
+    FxModule,
   ],
   controllers: [GroupsController, GroupsV2Controller, GroupInviteController, AnnouncementsController, GroupTemplatesController],
   providers: [
