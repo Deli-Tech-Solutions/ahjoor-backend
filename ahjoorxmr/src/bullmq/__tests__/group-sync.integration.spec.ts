@@ -18,6 +18,7 @@ import { Job, JobsOptions } from 'bullmq';
 import { GroupSyncProcessor } from '../group-sync.processor';
 import { QueueService } from '../queue.service';
 import { DeadLetterService } from '../dead-letter.service';
+import { CircuitBreakerAwareBackoffService } from '../circuit-breaker-aware-backoff.service';
 import { StellarService } from '../../stellar/stellar.service';
 import { Group } from '../../groups/entities/group.entity';
 import { GroupStatus } from '../../groups/entities/group-status.enum';
@@ -88,6 +89,14 @@ describe('Integration: Group Mediation Distributed Locking (#163)', () => {
           useValue: { add: jest.fn() },
         },
         { provide: getQueueToken(QUEUE_NAMES.DEAD_LETTER), useValue: { add: jest.fn() } },
+        {
+          provide: CircuitBreakerAwareBackoffService,
+          useValue: {
+            getBackoffDelay: jest.fn().mockReturnValue(5000),
+            recordFailure: jest.fn(),
+            recordSuccess: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -144,7 +153,7 @@ describe('Integration: Group Mediation Distributed Locking (#163)', () => {
   // ── AC2: BullMQ jobId deduplication via QueueService ─────────────────────
 
   it('AC2: addSyncGroupState passes jobId=groupId to prevent duplicate enqueues', async () => {
-    const module: TestingModule = await Test.createTestingModule({
+        const module: TestingModule = await Test.createTestingModule({
       providers: [
         QueueService,
         { provide: getQueueToken(QUEUE_NAMES.EMAIL), useValue: { add: jest.fn() } },
@@ -155,6 +164,14 @@ describe('Integration: Group Mediation Distributed Locking (#163)', () => {
           useValue: { add: jest.fn() },
         },
         { provide: getQueueToken(QUEUE_NAMES.DEAD_LETTER), useValue: { add: jest.fn() } },
+        {
+          provide: CircuitBreakerAwareBackoffService,
+          useValue: {
+            getBackoffDelay: jest.fn().mockReturnValue(5000),
+            recordFailure: jest.fn(),
+            recordSuccess: jest.fn(),
+          },
+        },
       ],
     }).compile();
 

@@ -70,6 +70,52 @@ export class Contribution {
   @Column({ type: 'varchar', length: 56, nullable: true, default: null })
   assetIssuer: string | null;
 
+  /**
+   * The group's unit-of-account asset code at contribution time.
+   * All aggregation and payout math is normalized to this asset.
+   */
+  @Column({ type: 'varchar', length: 12, default: 'XLM' })
+  unitOfAccountAssetCode: string;
+
+  /**
+   * Stellar issuer of the unit-of-account asset. Null for native XLM.
+   */
+  @Column({ type: 'varchar', length: 56, nullable: true, default: null })
+  unitOfAccountAssetIssuer: string | null;
+
+  /**
+   * FX rate locked at contribution submission time: 1 unit of assetCode
+   * = `fxRate` units of unitOfAccountAssetCode. '1' when assets match.
+   */
+  @Column({ type: 'varchar', length: 64, default: '1' })
+  fxRate: string;
+
+  /**
+   * ISO timestamp when the FX rate was captured.
+   */
+  @Column({ type: 'timestamp', nullable: true, default: null })
+  fxRateCapturedAt: Date | null;
+
+  /**
+   * ISO timestamp after which the locked FX rate is no longer honored.
+   */
+  @Column({ type: 'timestamp', nullable: true, default: null })
+  fxRateExpiresAt: Date | null;
+
+  /**
+   * Tolerance band in basis points (1 bp = 0.01%) for the locked rate.
+   * Default 200 (±2%).
+   */
+  @Column('int', { default: 200 })
+  fxToleranceBps: number;
+
+  /**
+   * Amount normalized to the group's unit-of-account asset.
+   * This is the value used in all aggregation, payout shares, and penalties.
+   */
+  @Column({ type: 'varchar', length: 100, nullable: true, default: null })
+  normalizedAmount: string | null;
+
   @Column({ type: 'enum', enum: ContributionStatus, default: ContributionStatus.PENDING })
   status: ContributionStatus;
 

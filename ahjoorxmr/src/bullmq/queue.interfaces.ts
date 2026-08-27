@@ -100,6 +100,14 @@ export interface DeadLetterJobData {
   failedAt: string;
   attemptsMade: number;
   stackTrace?: string;
+  /** Set when the job was detected as a poison message */
+  poisonMessage?: {
+    detected: boolean;
+    consecutiveFailures: number;
+    threshold: number;
+    signature: string;
+    errorClass: string;
+  };
 }
 
 // ---------------------------------------------------------------------------

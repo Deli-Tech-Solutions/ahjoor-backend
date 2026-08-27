@@ -21,6 +21,10 @@ import { PayoutTransaction } from './entities/payout-transaction.entity';
 import { PayoutTransactionStatus } from './entities/payout-transaction-status.enum';
 import { QueueService } from '../bullmq/queue.service';
 import { Penalty, PenaltyStatus } from '../penalties/entities/penalty.entity';
+import { FxService } from '../fx/fx.service';
+import { PathPaymentOutcome, PathPaymentResult } from '../fx/fx.types';
+import { Contribution, ContributionStatus } from '../contributions/entities/contribution.entity';
+import { Decimal } from 'decimal.js';
 
 @Injectable()
 export class PayoutService implements OnApplicationBootstrap {
@@ -35,10 +39,13 @@ export class PayoutService implements OnApplicationBootstrap {
     private readonly payoutTransactionRepository: Repository<PayoutTransaction>,
     @InjectRepository(Penalty)
     private readonly penaltyRepository: Repository<Penalty>,
+    @InjectRepository(Contribution)
+    private readonly contributionRepository: Repository<Contribution>,
     private readonly stellarService: StellarService,
     private readonly notificationsService: NotificationsService,
     private readonly queueService: QueueService,
     private readonly configService: ConfigService,
+    private readonly fxService: FxService,
   ) {}
 
   /**
@@ -143,26 +150,86 @@ export class PayoutService implements OnApplicationBootstrap {
       );
     }
 
+    // Payout asset = the group's unit of account.
+    const payoutAssetCode = group.unitOfAccountAssetCode ?? group.assetCode ?? 'XLM';
+    const payoutAssetIssuer = group.unitOfAccountAssetIssuer ?? group.assetIssuer ?? null;
+
+    // Compute the payout amount normalized to the unit of account.
+    // Round total = sum of normalized contribution amounts; fall back to the
+    // configured contribution amount when no contributions are recorded.
+    const payoutAmount = await this.computePayoutAmount(groupId, round, group);
+
     const payoutTransaction = this.payoutTransactionRepository.create({
       payoutOrderId,
       status: PayoutTransactionStatus.PENDING_SUBMISSION,
       txHash: null,
+      assetCode: payoutAssetCode,
+      assetIssuer: payoutAssetIssuer,
+      requestedAmount: payoutAmount,
     });
     await this.payoutTransactionRepository.save(payoutTransaction);
 
     let txHash: string;
     try {
-      txHash = await this.stellarService.disbursePayout(
-        group.contractAddress,
-        recipient.walletAddress,
-        group.contributionAmount,
-        async (calculatedHash: string) => {
-          payoutTransaction.txHash = calculatedHash;
-          await this.payoutTransactionRepository.save(payoutTransaction);
-        }
-      );
+      // If the payout asset differs from the group's declared contribution
+      // asset, use a path payment to deliver the normalized amount with FX
+      // rate honored. Otherwise use the direct contract call.
+      const contributionAssetCode = (group.assetCode ?? 'XLM').toUpperCase();
+      const needsPathPayment =
+        contributionAssetCode !== payoutAssetCode.toUpperCase();
 
-      payoutTransaction.txHash = txHash;
+      if (needsPathPayment) {
+        // The contract holds the contribution asset; converting to the unit of
+        // account at settlement follows the locked rates captured on the
+        // contributions. Use rate `1` (the payout is already normalized) and a
+        // tolerance band from the group policy.
+        const result: PathPaymentResult =
+          await this.stellarService.submitPathPayment(
+            contributionAssetCode,
+            group.assetIssuer ?? null,
+            payoutAssetCode,
+            payoutAssetIssuer,
+            payoutAmount,
+            '1',
+            group.fxToleranceBps ?? 200,
+            recipient.walletAddress,
+          );
+
+        if (
+          result.outcome === PathPaymentOutcome.SLIPPAGE_EXCEEDED ||
+          result.outcome === PathPaymentOutcome.FAILED
+        ) {
+          payoutTransaction.status = PayoutTransactionStatus.FAILED;
+          payoutTransaction.failureReason = result.reason ?? result.outcome;
+          payoutTransaction.pathPaymentOutcome = result.outcome;
+          await this.payoutTransactionRepository.save(payoutTransaction);
+          throw new BadGatewayException(
+            `Payout conversion ${result.outcome}: ${result.reason ?? 'Path payment failed'}`,
+          );
+        }
+
+        txHash = result.txHash ?? `payout_${payoutOrderId}`;
+        payoutTransaction.txHash = txHash;
+        payoutTransaction.deliveredAmount = result.deliveredAmount;
+        payoutTransaction.pathPaymentOutcome = result.outcome;
+        payoutTransaction.fxRate = result.lockedRate;
+      } else {
+        txHash = await this.stellarService.disbursePayout(
+          group.contractAddress,
+          recipient.walletAddress,
+          payoutAmount,
+          async (calculatedHash: string) => {
+            payoutTransaction.txHash = calculatedHash;
+            await this.payoutTransactionRepository.save(payoutTransaction);
+          },
+          payoutAssetCode,
+          payoutAssetIssuer,
+        );
+
+        payoutTransaction.txHash = txHash;
+        payoutTransaction.deliveredAmount = payoutAmount;
+        payoutTransaction.pathPaymentOutcome = PathPaymentOutcome.FULL_FILL;
+      }
 
       if (
         this.configService.get<string>(
@@ -232,6 +299,52 @@ export class PayoutService implements OnApplicationBootstrap {
 
   private buildPayoutOrderId(groupId: string, round: number): string {
     return `${groupId}:${round}`;
+  }
+
+  /**
+   * Computes the payout amount for a round, normalized to the group's
+   * unit-of-account asset.
+   *
+   * The round total is the sum of all confirmed contributions' normalized
+   * amounts (each contribution is normalized to the unit of account using its
+   * locked FX rate). If no contributions are recorded, falls back to the
+   * configured contribution amount.
+   *
+   * @param groupId - The group UUID.
+   * @param round - The round number (1-indexed).
+   * @param group - The group entity (for fallback amount).
+   * @returns The payout amount as a string.
+   */
+  private async computePayoutAmount(
+    groupId: string,
+    round: number,
+    group: Group,
+  ): Promise<string> {
+    const contributions = await this.contributionRepository.find({
+      where: {
+        groupId,
+        roundNumber: round,
+        status: ContributionStatus.CONFIRMED,
+      },
+    });
+
+    if (contributions.length === 0) {
+      return group.contributionAmount;
+    }
+
+    let total = new Decimal(0);
+    for (const contribution of contributions) {
+      // Prefer the normalized amount (unit of account); fall back to the raw
+      // amount multiplied by the locked FX rate.
+      const amount = contribution.normalizedAmount
+        ? new Decimal(contribution.normalizedAmount)
+        : new Decimal(contribution.amount).times(
+            new Decimal(contribution.fxRate ?? '1'),
+          );
+      total = total.plus(amount);
+    }
+
+    return total.toFixed(7);
   }
 
   async onApplicationBootstrap() {

@@ -1,0 +1,95 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue, Job } from 'bullmq';
+import { QUEUE_NAMES, JOB_NAMES } from './queue.constants';
+import { DeadLetterJobData } from './queue.interfaces';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+
+export interface DeadLetterResult {
+  moved: boolean;
+  reason: 'max_retries' | 'poison_message';
+  consecutiveFailures?: number;
+  alertTriggered?: boolean;
+}
+
+@Injectable()
+export class DeadLetterService {
+  private readonly logger = new Logger(DeadLetterService.name);
+
+  constructor(
+    @InjectQueue(QUEUE_NAMES.DEAD_LETTER)
+    private readonly deadLetterQueue: Queue,
+    private readonly poisonMessageDetector: PoisonMessageDetectorService,
+    private readonly alertingService: DeadLetterAlertingService,
+  ) {}
+
+  /**
+   * Move a job to the dead-letter queue.
+   * Also checks for poison-message detection and triggers volume alerts.
+   *
+   * @param job The failed BullMQ job
+   * @param error The error that caused the failure
+   * @param originalQueue The name of the original queue
+   * @returns Result indicating whether the job was moved and why
+   */
+  async moveToDeadLetter(
+    job: Job,
+    error: Error,
+    originalQueue: string,
+  ): Promise<DeadLetterResult> {
+    // Check for poison message before moving
+    const poisonResult = this.poisonMessageDetector.recordFailure(job, error);
+
+    const payload: DeadLetterJobData = {
+      originalQueue,
+      originalJobId: job.id?.toString(),
+      originalJobName: job.name,
+      originalJobData: job.data,
+      failedReason: error.message,
+      failedAt: new Date().toISOString(),
+      attemptsMade: job.attemptsMade,
+      stackTrace: error.stack,
+    };
+
+    // Add poison-message metadata to the dead-letter payload
+    if (poisonResult.isPoison) {
+      (payload as any).poisonMessage = {
+        detected: true,
+        consecutiveFailures: poisonResult.consecutiveFailures,
+        threshold: poisonResult.threshold,
+        signature: poisonResult.signature,
+        errorClass: poisonResult.errorClass,
+      };
+    }
+
+    this.logger.error(
+      `Dead-letter entry: queue=${originalQueue} jobName=${job.name} jobId=${job.id} ` +
+        `reason="${error.message}" poison=${poisonResult.isPoison}`,
+      {
+        ...payload,
+        // omit potentially large data from log line
+        originalJobData: '[see dead-letter queue]',
+      },
+    );
+
+    await this.deadLetterQueue.add(JOB_NAMES.DEAD_LETTER, payload, {
+      removeOnComplete: false,
+      removeOnFail: false,
+    });
+
+    // Trigger volume alerting
+    const alertTriggered = this.alertingService.recordDeadLetter(
+      originalQueue,
+      job.name,
+      error,
+    );
+
+    return {
+      moved: true,
+      reason: poisonResult.isPoison ? 'poison_message' : 'max_retries',
+      consecutiveFailures: poisonResult.consecutiveFailures,
+      alertTriggered,
+    };
+  }
+}

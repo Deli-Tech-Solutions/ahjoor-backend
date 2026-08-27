@@ -39,6 +39,44 @@ export class Group extends BaseEntity {
   @Column({ type: 'varchar', length: 56, nullable: true, default: null })
   assetIssuer: string | null;
 
+  /**
+   * Unit-of-account asset code — the asset in which all aggregation,
+   * payout math, and penalties are denominated. Defaults to assetCode.
+   * When a group is denominated in USDC but members contribute in XLM,
+   * this is the asset the XLM is converted into.
+   */
+  @Column({ type: 'varchar', length: 12, default: 'XLM' })
+  unitOfAccountAssetCode: string;
+
+  /**
+   * Stellar account ID of the unit-of-account asset issuer.
+   * Null for native XLM.
+   */
+  @Column({ type: 'varchar', length: 56, nullable: true, default: null })
+  unitOfAccountAssetIssuer: string | null;
+
+  /**
+   * FX rate lock expiry in seconds. A rate captured at contribution
+   * submission time is honored for this long. Default 900 (15 min).
+   */
+  @Column('int', { default: 900 })
+  fxRateExpirySeconds: number;
+
+  /**
+   * FX tolerance band in basis points (1 bp = 0.01%). Default 200 (±2%).
+   * If the effective path-payment rate deviates beyond this from the
+   * locked rate, the payment is rejected as slippage-exceeded.
+   */
+  @Column('int', { default: 200 })
+  fxToleranceBps: number;
+
+  /**
+   * Whether contributions in assets other than the unit-of-account are
+   * allowed. Default true.
+   */
+  @Column('boolean', { default: true })
+  allowCrossAssetContributions: boolean;
+
   @Column('int')
   roundDuration: number;
 

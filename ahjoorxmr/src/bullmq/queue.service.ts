@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue, JobsOptions } from 'bullmq';
-import { QUEUE_NAMES, JOB_NAMES, RETRY_CONFIG } from './queue.constants';
+import { QUEUE_NAMES, JOB_NAMES, RETRY_CONFIG, DOWNSTREAM_NAMES } from './queue.constants';
 import {
   SendEmailJobData,
   SendNotificationEmailJobData,
@@ -17,6 +17,7 @@ import {
 } from './queue.interfaces';
 import { TxConfirmationJobData } from './tx-confirmation.processor';
 import { injectTraceContext } from '../common/tracing/stellar-tracing';
+import { CircuitBreakerAwareBackoffService } from './circuit-breaker-aware-backoff.service';
 
 export interface QueueStats {
   name: string;
@@ -48,7 +49,7 @@ function defaultJobOptions(overrides: Partial<JobsOptions> = {}): JobsOptions {
 }
 
 /** Attach W3C traceparent to job data so processors can restore the span. */
-function withTraceContext<T extends Record<string, unknown>>(data: T): T & { _traceContext: Record<string, string> } {
+function withTraceContext<T extends object>(data: T): T & { _traceContext: Record<string, string> } {
   const carrier: Record<string, string> = {};
   injectTraceContext(carrier);
   return { ...data, _traceContext: carrier };
@@ -72,7 +73,32 @@ export class QueueService {
     private readonly pushNotificationQueue: Queue,
     @InjectQueue(QUEUE_NAMES.TRUST_SCORE)
     private readonly trustScoreQueue: Queue,
+    private readonly backoffService: CircuitBreakerAwareBackoffService,
   ) {}
+
+  /**
+   * Get a circuit-breaker-aware backoff delay for a downstream dependency.
+   * All jobs targeting the same downstream share this coordinated backoff.
+   */
+  getBackoffDelay(downstream: string, attemptsMade: number): number {
+    return this.backoffService.getBackoffDelay(downstream, attemptsMade);
+  }
+
+  /**
+   * Record a failure for a downstream dependency.
+   * Updates the shared backoff state and coordinates the circuit breaker.
+   */
+  recordBackoffFailure(downstream: string, error: Error): void {
+    this.backoffService.recordFailure(downstream, error);
+  }
+
+  /**
+   * Record a success for a downstream dependency.
+   * Resets the shared backoff state.
+   */
+  recordBackoffSuccess(downstream: string): void {
+    this.backoffService.recordSuccess(downstream);
+  }
 
   // ---------------------------------------------------------------------------
   // Email queue helpers

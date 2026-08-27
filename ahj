@@ -1,472 +1,304 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, Repository, Between, LessThan } from 'typeorm';
-import { ConfigService } from '@nestjs/config';
-import { createHmac } from 'crypto';
-import { AuditLog } from './entities/audit-log.entity';
-import { AuditLogQueryDto } from './dto/audit-log-query.dto';
 import {
-  PaginatedAuditLogResponseDto,
-  AuditLogResponseDto,
-} from './dto/audit-log-response.dto';
-import { UseReadReplica } from '../common/decorators/read-replica.decorator';
-import { AuditExportQueryDto } from './dto/audit-export-query.dto';
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Query,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+  Request,
+  ForbiddenException,
+  NotFoundException,
+  UseInterceptors,
+} from '@nestjs/common';
 import {
-  computeRowHash,
-  CHAIN_PARTITION_GLOBAL,
-} from './audit-chain-hash';
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+  ApiParam,
+  ApiBody,
+} from '@nestjs/swagger';
+import { IsArray, IsDateString, IsOptional, IsString, IsUUID } from 'class-validator';
+import { QueueService, AllQueueStats } from './queue.service';
+import { JobFailureService, BulkRetryFilter } from './job-failure.service';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+import { CircuitBreakerAwareBackoffService } from './circuit-breaker-aware-backoff.service';
+import { AuditService } from '../audit/audit.service';
+import { JwtAuthGuard } from '../stellar-auth/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { PaginationDto, PaginatedResponseDto } from '../common/dto/pagination.dto';
+import { PaginationLinkHeaderInterceptor } from '../common/interceptors/pagination-link-header.interceptor';
 
-/**
- * Result returned by the integrity verification walk.
- */
-export interface AuditIntegrityReport {
-  ok: boolean;
-  totalRows: number;
-  verifiedRows: number;
-  firstBrokenLink: {
-    index: number;
-    id: string;
-    expectedHash: string;
-    actualHash: string;
-    reason: 'MISMATCH' | 'MISSING_HASH' | 'DUPLICATE_SEQUENCE';
-  } | null;
-  chainId: string | null;
-  chainPartition: string;
-  anchorVerified: boolean;
-  anchorMessage: string;
-  checkedAt: string;
+class BulkRetryDto implements BulkRetryFilter {
+  @IsOptional()
+  @IsArray()
+  @IsUUID('all', { each: true })
+  ids?: string[];
+
+  @IsOptional()
+  @IsString()
+  queueName?: string;
+
+  @IsOptional()
+  @IsString()
+  errorType?: string;
+
+  @IsOptional()
+  @IsDateString()
+  createdBefore?: string;
 }
 
-@Injectable()
-export class AuditService {
-  private readonly logger = new Logger(AuditService.name);
-
+@ApiTags('Admin – Queue')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles('admin')
+@Controller({ path: 'admin/queue', version: '1' })
+export class QueueAdminController {
   constructor(
-    @InjectRepository(AuditLog)
-    private readonly auditLogRepository: Repository<AuditLog>,
-    private readonly configService: ConfigService,
-    private readonly dataSource: DataSource,
+    private readonly queueService: QueueService,
+    private readonly jobFailureService: JobFailureService,
+    private readonly poisonMessageDetector: PoisonMessageDetectorService,
+    private readonly deadLetterAlerting: DeadLetterAlertingService,
+    private readonly circuitBreakerBackoff: CircuitBreakerAwareBackoffService,
+    private readonly auditService: AuditService,
   ) {}
 
-  /**
-   * Append a new audit log row with tamper-evidence.
-   *
-   * The new row's `hash` is computed as SHA-256 of its own canonical content
-   * plus the previous row's hash (per chain partition). To protect against
-   * concurrent writers corrupting the chain sequence, the read-last-hash and
-   * insert are performed inside a transaction that takes a PostgreSQL
-   * advisory transaction lock scoped to the chain.
-   *
-   * @param data - audit log data (without hash/prevHash/chainId — these are computed)
-   */
-  async createLog(data: Partial<AuditLog>): Promise<AuditLog> {
-    return this.dataSource.transaction(async (manager) => {
-      const repo = manager.getRepository(AuditLog);
-      const chainPartition = data.chainPartition || CHAIN_PARTITION_GLOBAL;
+  @Get('stats')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get queue depths and failed-job counts (admin only)' })
+  @ApiResponse({ status: 200, description: 'Queue statistics for all queues including the dead-letter queue' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getStats(): Promise<AllQueueStats> {
+    return this.queueService.getStats();
+  }
 
-      // Serialize concurrent writers for the same chain so we cannot create
-      // two rows with the same prevHash (double-spend style chain corruption).
-      const lockKey = `audit_chain_${chainPartition}`;
-      // Hash the key so it fits in a bigint.
-      const lockNum = this.chainLockBigInt(lockKey);
-      await manager.query(
-        `SELECT pg_advisory_xact_lock(${lockNum})`,
-      );
-
-      // 1. Resolve chainId (first row creates a new chain).
-      let chainId = data.chainId;
-      if (!chainId) {
-        const first = await repo
-          .createQueryBuilder('al')
-          .select('al.chainId', 'chainId')
-          .where('al.chainPartition = :p', { p: chainPartition })
-          .orderBy('al.timestamp', 'ASC')
-          .addOrderBy('al.id', 'ASC')
-          .getRawOne();
-        chainId = first?.chainId;
-      }
-
-      // 2. Find previous row's hash.
-      const prev = await repo
-        .createQueryBuilder('al')
-        .where('al.chainPartition = :p', { p: chainPartition })
-        .andWhere(chainId ? 'al.chainId = :chainId' : '1=1', {
-          chainId,
-        })
-        .orderBy('al.timestamp', 'DESC')
-        .addOrderBy('al.id', 'DESC')
-        .getOne();
-
-      const prevHash = prev?.hash ?? '';
-      const cid = chainId ?? crypto.randomUUID();
-
-      // 3. Insert the row first (to get the id/timestamp), then compute hash.
-      const log = repo.create({
-        ...data,
-        chainId: cid,
-        chainPartition,
-        chainVersion: data.chainVersion ?? 1,
-        prevHash,
-        hash: '', // placeholder — computed and updated below
-      });
-      const saved = await repo.save(log);
-
-      // 4. Compute the row hash (canonical content + prevHash) and persist.
-      const timestampIso = this.toIso(saved.timestamp);
-      const hash = computeRowHash({
-        id: saved.id,
-        userId: saved.userId ?? null,
-        action: saved.action ?? '',
-        resource: saved.resource ?? '',
-        metadata: saved.metadata ?? null,
-        timestamp: timestampIso,
-        ipAddress: saved.ipAddress ?? null,
-        userAgent: saved.userAgent ?? null,
-        requestPayload: saved.requestPayload ?? null,
-        prevHash,
-        chainId: cid,
-        chainPartition,
-        chainVersion: saved.chainVersion ?? 1,
-      });
-
-      saved.hash = hash;
-      saved.prevHash = prevHash;
-      await repo.update(saved.id, { hash });
-
-      return saved;
-    });
+  @Get('dead-letter')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(PaginationLinkHeaderInterceptor)
+  @ApiOperation({ summary: 'Get dead letter queue jobs (admin only)' })
+  @ApiResponse({ status: 200, description: 'Dead letter queue jobs retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getDeadLetterJobs(@Query() pagination: PaginationDto) {
+    const { page = 1, limit = 20 } = pagination;
+    const all = await this.queueService.getDeadLetterJobs();
+    const start = (page - 1) * limit;
+    const data = all.slice(start, start + limit);
+    return PaginatedResponseDto.of(data, all.length, page, limit);
   }
 
   /**
-   * Record an external anchor reference on a row (used by AuditAnchorService).
+   * GET /admin/queue/poison-messages
+   * Returns all currently tracked poison-message candidates.
    */
-  async recordAnchorReference(
-    id: string,
-    anchorReference: string,
-  ): Promise<void> {
-    await this.auditLogRepository.update(id, { anchorReference });
-  }
-
-  /**
-   * Integrity-verification job/endpoint.
-   *
-   * Walks the chain from the first row forward, recomputing each row's hash
-   * from its canonical content + previous row's hash, and reports the first
-   * broken link (if any). Also checks that the anchor (if any) matches the
-   * current chain head.
-   *
-   * @param options.chainId        - restrict to a specific chain (default: global chain)
-   * @param options.chainPartition - partition key (default: 'GLOBAL')
-   * @param options.limit          - cap the number of rows walked (default 100000)
-   */
-  async verifyIntegrity(options?: {
-    chainId?: string;
-    chainPartition?: string;
-    limit?: number;
-  }): Promise<AuditIntegrityReport> {
-    const chainPartition = options?.chainPartition || CHAIN_PARTITION_GLOBAL;
-    const limit = options?.limit ?? 100000;
-
-    // Resolve the chain if not provided
-    let chainId = options?.chainId;
-    if (!chainId) {
-      const first = await this.auditLogRepository
-        .createQueryBuilder('al')
-        .select('al.chainId', 'chainId')
-        .where('al.chainPartition = :p', { p: chainPartition })
-        .orderBy('al.timestamp', 'ASC')
-        .addOrderBy('al.id', 'ASC')
-        .getRawOne();
-      chainId = first?.chainId;
-    }
-
-    if (!chainId) {
-      return {
-        ok: true,
-        totalRows: 0,
-        verifiedRows: 0,
-        firstBrokenLink: null,
-        chainId: null,
-        chainPartition,
-        anchorVerified: true,
-        anchorMessage: 'Empty chain — nothing to verify',
-        checkedAt: new Date().toISOString(),
-      };
-    }
-
-    // Fetch rows in chain order.
-    const rows = await this.auditLogRepository.find({
-      where: { chainId, chainPartition },
-      order: { timestamp: 'ASC', id: 'ASC' },
-      take: limit,
-    });
-
-    let prevHash = '';
-    let verifiedCount = 0;
-    let firstBroken: AuditIntegrityReport['firstBrokenLink'] = null;
-
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
-
-      // 1. First-row chain-link check
-      if (i === 0 && (row.prevHash ?? '') !== '') {
-        firstBroken = {
-          index: i,
-          id: row.id,
-          expectedHash: '',
-          actualHash: row.prevHash,
-          reason: 'MISMATCH',
-        };
-        break;
-      }
-
-      // 2. prevHash continuity check
-      if (row.prevHash !== prevHash) {
-        firstBroken = {
-          index: i,
-          id: row.id,
-          expectedHash: prevHash,
-          actualHash: row.prevHash,
-          reason: 'MISMATCH',
-        };
-        break;
-      }
-
-      // 3. Recompute hash and compare
-      const expected = computeRowHash({
-        id: row.id,
-        userId: row.userId ?? null,
-        action: row.action ?? '',
-        resource: row.resource ?? '',
-        metadata: row.metadata ?? null,
-        timestamp: this.toIso(row.timestamp),
-        ipAddress: row.ipAddress ?? null,
-        userAgent: row.userAgent ?? null,
-        requestPayload: row.requestPayload ?? null,
-        prevHash: row.prevHash ?? '',
-        chainId: row.chainId ?? '',
-        chainPartition: row.chainPartition ?? chainPartition,
-        chainVersion: row.chainVersion ?? 1,
-      });
-
-      if (row.hash !== expected) {
-        firstBroken = {
-          index: i,
-          id: row.id,
-          expectedHash: expected,
-          actualHash: row.hash ?? '(missing)',
-          reason: 'MISMATCH',
-        };
-        break;
-      }
-
-      verifiedCount++;
-      prevHash = row.hash;
-    }
-
-    const ok = firstBroken === null;
-
-    // 4. Anchor check (compare latest anchor to current head)
-    let anchorOk = true;
-    let anchorMessage = 'No anchor configured for this chain';
-    if (ok && rows.length > 0) {
-      const head = rows[rows.length - 1];
-      const latestAnchor = await this.auditLogRepository.manager
-        .getRepository(require('./entities/audit-anchor.entity').AuditAnchor)
-        .createQueryBuilder('anchor')
-        .where('anchor.chainId = :chainId', { chainId })
-        .andWhere('anchor.chainPartition = :chainPartition', {
-          chainPartition,
-        })
-        .orderBy('anchor.sequence', 'DESC')
-        .getOne();
-
-      if (latestAnchor) {
-        anchorOk = latestAnchor.chainHeadHash === head.hash;
-        anchorMessage = anchorOk
-          ? `Anchor (${latestAnchor.anchorType}) matches chain head`
-          : `Anchor mismatch: stored ${latestAnchor.chainHeadHash} != actual head ${head.hash}`;
-      }
-    }
-
+  @Get('poison-messages')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get poison-message candidates (admin only)' })
+  @ApiResponse({ status: 200, description: 'Poison-message candidates retrieved' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getPoisonMessages() {
+    const candidates = this.poisonMessageDetector.getAllPoisonCandidates();
     return {
-      ok: ok && anchorOk,
-      totalRows: rows.length,
-      verifiedRows: verifiedCount,
-      firstBrokenLink: firstBroken,
-      chainId,
-      chainPartition,
-      anchorVerified: anchorOk,
-      anchorMessage,
-      checkedAt: new Date().toISOString(),
+      success: true,
+      data: candidates,
+      total: candidates.length,
     };
   }
 
-  async findAll(
-    query: AuditLogQueryDto,
-  ): Promise<PaginatedAuditLogResponseDto> {
-    const {
-      userId,
-      action,
-      resource,
-      startDate,
-      endDate,
-      page = 1,
-      limit = 20,
-    } = query;
-
-    const whereConditions: any = {};
-
-    if (userId) {
-      whereConditions.userId = userId;
+  /**
+   * GET /admin/queue/poison-messages/:jobId
+   * Returns the poison-message status for a specific job.
+   */
+  @Get('poison-messages/:jobId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get poison-message status for a job (admin only)' })
+  @ApiParam({ name: 'jobId', description: 'The BullMQ job ID' })
+  @ApiResponse({ status: 200, description: 'Poison-message status retrieved' })
+  @ApiResponse({ status: 404, description: 'Job not found in poison-message tracker' })
+  async getPoisonMessageStatus(@Param('jobId') jobId: string) {
+    const status = this.poisonMessageDetector.getPoisonStatus(jobId);
+    if (!status) {
+      throw new NotFoundException(`Job ${jobId} not found in poison-message tracker`);
     }
+    return { success: true, data: status };
+  }
 
-    if (action) {
-      whereConditions.action = action;
-    }
+  /**
+   * POST /admin/queue/poison-messages/:jobId/clear
+   * Clears the poison-message tracking for a job.
+   */
+  @Post('poison-messages/:jobId/clear')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Clear poison-message tracking for a job (admin only)' })
+  @ApiParam({ name: 'jobId', description: 'The BullMQ job ID' })
+  @ApiResponse({ status: 200, description: 'Poison-message tracking cleared' })
+  async clearPoisonMessage(
+    @Param('jobId') jobId: string,
+    @Request() req: any,
+  ) {
+    this.poisonMessageDetector.clearJob(jobId);
 
-    if (resource) {
-      whereConditions.resource = resource;
-    }
-
-    if (startDate && endDate) {
-      whereConditions.timestamp = Between(
-        new Date(startDate),
-        new Date(endDate),
-      );
-    } else if (startDate) {
-      whereConditions.timestamp = Between(new Date(startDate), new Date());
-    }
-
-    const skip = (page - 1) * limit;
-
-    const [logs, total] = await this.auditLogRepository.findAndCount({
-      where: whereConditions,
-      order: { timestamp: 'DESC' },
-      skip,
-      take: limit, // always apply LIMIT so idx_audit_user_created is exercised
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_POISON_MESSAGE_CLEAR',
+      resource: 'poison_messages',
+      metadata: { jobId },
     });
 
+    return { success: true, message: `Poison-message tracking cleared for job ${jobId}` };
+  }
+
+  /**
+   * GET /admin/queue/dead-letter/volume
+   * Returns dead-letter volume states for all queues.
+   */
+  @Get('dead-letter/volume')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get dead-letter volume states (admin only)' })
+  @ApiResponse({ status: 200, description: 'Dead-letter volume states retrieved' })
+  async getDeadLetterVolume() {
+    const states = this.deadLetterAlerting.getAllVolumeStates();
     return {
-      data: logs.map((log) => AuditLogResponseDto.fromEntity(log)),
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
+      success: true,
+      data: states,
+      total: states.length,
     };
   }
 
-  async archiveOldLogs(daysOld: number = 365): Promise<number> {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+  /**
+   * GET /admin/queue/backoff-states
+   * Returns circuit-breaker-aware backoff states for all downstreams.
+   */
+  @Get('backoff-states')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get circuit-breaker-aware backoff states (admin only)' })
+  @ApiResponse({ status: 200, description: 'Backoff states retrieved' })
+  async getBackoffStates() {
+    const states = this.circuitBreakerBackoff.getAllDownstreamStates();
+    return {
+      success: true,
+      data: states,
+      total: states.length,
+    };
+  }
 
+  /**
+   * POST /admin/queue/backoff-states/:downstream/reset
+   * Resets the backoff state for a specific downstream.
+   */
+  @Post('backoff-states/:downstream/reset')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reset backoff state for a downstream (admin only)' })
+  @ApiParam({ name: 'downstream', description: 'Downstream dependency name (e.g. stellar-rpc)' })
+  @ApiResponse({ status: 200, description: 'Backoff state reset' })
+  async resetBackoffState(
+    @Param('downstream') downstream: string,
+    @Request() req: any,
+  ) {
+    this.circuitBreakerBackoff.resetDownstream(downstream);
+
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_BACKOFF_STATE_RESET',
+      resource: 'backoff_states',
+      metadata: { downstream },
+    });
+
+    return { success: true, message: `Backoff state reset for downstream=${downstream}` };
+  }
+
+  /**
+   * POST /admin/dead-letter/:id/retry
+   * Re-enqueues a single job from the dead-letter records and marks it RETRYING.
+   */
+  @Post('dead-letter/:id/retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Retry a single dead-letter job by its record ID (admin only)' })
+  @ApiParam({ name: 'id', description: 'UUID of the JobFailure record' })
+  @ApiResponse({ status: 200, description: 'Job re-enqueued successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  @ApiResponse({ status: 404, description: 'Job failure record not found' })
+  async retryDeadLetterJob(
+    @Param('id') id: string,
+    @Request() req: any,
+  ) {
+    let result: Awaited<ReturnType<typeof this.jobFailureService.retryById>>;
     try {
-      const result = await this.auditLogRepository.delete({
-        timestamp: LessThan(cutoffDate),
-      });
-
-      const count = result.affected || 0;
-      this.logger.log(
-        `Archived ${count} audit logs older than ${daysOld} days`,
-      );
-
-      return count;
-    } catch (error) {
-      this.logger.error('Failed to archive old logs', error);
-      throw error;
+      result = await this.jobFailureService.retryById(id);
+    } catch (err) {
+      if ((err as Error).message?.includes('Could not find any entity')) {
+        throw new NotFoundException(`JobFailure record ${id} not found`);
+      }
+      throw err;
     }
+
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_DEAD_LETTER_RETRY',
+      resource: 'job_failures',
+      metadata: {
+        recordId: id,
+        queueName: result.record.queueName,
+        jobName: result.record.jobName,
+        originalJobId: result.record.jobId,
+        enqueuedJobId: result.enqueuedJobId,
+      },
+    });
+
+    return {
+      success: true,
+      recordId: id,
+      enqueuedJobId: result.enqueuedJobId,
+      status: result.record.status,
+      retryCount: result.record.retryCount,
+    };
   }
 
   /**
-   * Returns the last 100 impersonation events for compliance review.
+   * POST /admin/dead-letter/bulk-retry
+   * Accepts either an array of IDs or a filter {queueName, errorType, createdBefore}.
    */
-  async findImpersonationLogs(): Promise<AuditLog[]> {
-    return this.auditLogRepository.find({
-      where: { action: 'IMPERSONATION_REQUEST' },
-      order: { timestamp: 'DESC' },
-      take: 100,
-    });
-  }
+  @Post('dead-letter/bulk-retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Bulk retry dead-letter jobs by IDs or filter (admin only)' })
+  @ApiBody({ type: BulkRetryDto })
+  @ApiResponse({ status: 200, description: 'Bulk retry results' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async bulkRetryDeadLetterJobs(
+    @Body() dto: BulkRetryDto,
+    @Request() req: any,
+  ) {
+    const result = await this.jobFailureService.bulkRetry(dto);
+    const adminUserId: string = req.user?.id ?? 'unknown';
 
-  async exportAuditLogs(
-    query: AuditExportQueryDto,
-  ): Promise<{ logs: AuditLog[]; count: number }> {
-    const whereConditions: any = {};
-
-    if (query.from && query.to) {
-      whereConditions.timestamp = Between(new Date(query.from), new Date(query.to));
-    } else if (query.from) {
-      whereConditions.timestamp = Between(new Date(query.from), new Date());
-    }
-
-    if (query.eventTypes && query.eventTypes.length > 0) {
-      whereConditions.action = query.eventTypes;
-    }
-
-    const [logs, count] = await this.auditLogRepository.findAndCount({
-      where: whereConditions,
-      order: { timestamp: 'DESC' },
-      take: 100000,
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_DEAD_LETTER_BULK_RETRY',
+      resource: 'job_failures',
+      metadata: {
+        filter: dto,
+        total: result.total,
+        succeeded: result.results.filter((r) => r.success).length,
+        failed: result.results.filter((r) => !r.success).length,
+      },
     });
 
-    return { logs, count };
+    return result;
   }
 
-  redactPii(log: AuditLog): any {
-    const redacted = { ...log };
-    if (redacted.metadata?.email) {
-      redacted.metadata.email = '[REDACTED]';
-    }
-    if (redacted.metadata?.walletAddress) {
-      redacted.metadata.walletAddress = '[REDACTED]';
-    }
-    return redacted;
-  }
-
-  generateHmacSignature(data: string): string {
-    const secret = this.configService.get<string>('PII_HMAC_SECRET');
-    return createHmac('sha256', secret).update(data).digest('hex');
-  }
-
-  formatAsJson(logs: AuditLog[], includePii: boolean): string {
-    const data = includePii ? logs : logs.map((log) => this.redactPii(log));
-    return JSON.stringify(data, null, 2);
-  }
-
-  formatAsCsv(logs: AuditLog[], includePii: boolean): string {
-    if (logs.length === 0) return 'id,userId,action,resource,timestamp,ipAddress\n';
-
-    const headers = 'id,userId,action,resource,timestamp,ipAddress\n';
-    const rows = logs.map((log) => {
-      const processed = includePii ? log : this.redactPii(log);
-      return `${processed.id},${processed.userId || ''},${processed.action},${processed.resource},${processed.timestamp.toISOString()},${processed.ipAddress || ''}`;
-    });
-
-    return headers + rows.join('\n');
-  }
-
-  /**
-   * Convert a Date (or any value) to an ISO-8601 string for hashing.
-   */
-  private toIso(value: Date | string | undefined | null): string {
-    if (value instanceof Date) return value.toISOString();
-    if (typeof value === 'string') {
-      const d = new Date(value);
-      return isNaN(d.getTime()) ? value : d.toISOString();
-    }
-    return new Date().toISOString();
-  }
-
-  /**
-   * Convert a chain lock name to a stable positive bigint for
-   * pg_advisory_xact_lock.
-   */
-  private chainLockBigInt(lockKey: string): string {
-    let hash = 0;
-    for (let i = 0; i < lockKey.length; i++) {
-      hash = (hash * 31 + lockKey.charCodeAt(i)) >>> 0;
-    }
-    // Postgres advisory locks accept positive bigint; use two-int form to be safe.
-    return String(hash % 2147483647);
+  @Post('retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Retry a failed job from dead letter queue (admin only)' })
+  @ApiResponse({ status: 200, description: 'Job retry initiated successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async retryJob(@Body() body: { jobId: string }) {
+    return this.queueService.retryDeadLetterJob(body.jobId);
   }
 }

@@ -18,6 +18,8 @@ import { MetricsService } from '../metrics/metrics.service';
 import { withStellarSpan } from '../common/tracing/stellar-tracing';
 import { RedisService } from '../common/redis/redis.service';
 import { WebhookService } from '../webhooks/webhook.service';
+import { PathPaymentOutcome, PathPaymentResult } from '../fx/fx.types';
+import { Decimal } from 'decimal.js';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -404,6 +406,272 @@ export class StellarService {
       this.metricsService.incrementStellarTransaction(false);
       throw this.mapRpcError('Failed to disburse payout on-chain', error);
     }
+  }
+
+  /**
+   * Submits a Stellar path payment to convert a source asset into a
+   * destination asset, honoring a locked FX rate with a tolerance band.
+   *
+   * Path payments on Stellar can partially fill or fail differently than
+   * direct transfers. This method treats those as distinct, handled outcomes:
+   *  - FULL_FILL: the full destination amount was delivered.
+   *  - PARTIAL_FILL: less than requested was delivered but within tolerance.
+   *  - SLIPPAGE_EXCEEDED: the effective rate deviated beyond the tolerance
+   *    band; no fill was accepted.
+   *  - FAILED: the transaction failed for a non-slippage reason.
+   *
+   * @param sourceAssetCode - Asset code the sender is paying in.
+   * @param sourceAssetIssuer - Issuer of the source asset (null for XLM).
+   * @param destinationAssetCode - Asset code to deliver (the group's unit of account).
+   * @param destinationAssetIssuer - Issuer of the destination asset (null for XLM).
+   * @param destinationAmount - Amount to deliver at the destination (string).
+   * @param lockedRate - The FX rate locked at submission time (destination per source).
+   * @param toleranceBps - Tolerance band in basis points.
+   * @param senderWallet - The wallet sending the payment.
+   * @returns A PathPaymentResult describing the outcome.
+   */
+  async submitPathPayment(
+    sourceAssetCode: string,
+    sourceAssetIssuer: string | null,
+    destinationAssetCode: string,
+    destinationAssetIssuer: string | null,
+    destinationAmount: string,
+    lockedRate: string,
+    toleranceBps: number,
+    senderWallet: string,
+  ): Promise<PathPaymentResult> {
+    return withStellarSpan(
+      'stellar.submit_path_payment',
+      { network: this.networkPassphrase },
+      async (span) => {
+        span.setAttributes({
+          'stellar.operation': 'path_payment',
+          'stellar.source_asset': sourceAssetCode,
+          'stellar.destination_asset': destinationAssetCode,
+          'stellar.destination_amount': destinationAmount,
+          'stellar.locked_rate': lockedRate,
+        });
+        return this.submitPathPayment_impl(
+          sourceAssetCode,
+          sourceAssetIssuer,
+          destinationAssetCode,
+          destinationAssetIssuer,
+          destinationAmount,
+          lockedRate,
+          toleranceBps,
+          senderWallet,
+        );
+      },
+    );
+  }
+
+  private async submitPathPayment_impl(
+    sourceAssetCode: string,
+    sourceAssetIssuer: string | null,
+    destinationAssetCode: string,
+    destinationAssetIssuer: string | null,
+    destinationAmount: string,
+    lockedRate: string,
+    toleranceBps: number,
+    senderWallet: string,
+  ): Promise<PathPaymentResult> {
+    this.validateConfiguration();
+
+    const sourceAsset = this.buildAsset(sourceAssetCode, sourceAssetIssuer);
+    const destinationAsset = this.buildAsset(destinationAssetCode, destinationAssetIssuer);
+
+    // If source and destination are the same asset, this is a direct transfer.
+    if (
+      sourceAssetCode.toUpperCase() === destinationAssetCode.toUpperCase() &&
+      (sourceAssetIssuer ?? null) === (destinationAssetIssuer ?? null)
+    ) {
+      return {
+        outcome: PathPaymentOutcome.FULL_FILL,
+        deliveredAmount: destinationAmount,
+        requestedAmount: destinationAmount,
+        effectiveRate: '1',
+        lockedRate: '1',
+        reason: 'Same-asset transfer; no conversion needed',
+      };
+    }
+
+    try {
+      const sourceAccount = new (StellarSdk as any).Account(senderWallet, '0');
+
+      const operation = (StellarSdk as any).Operation.pathPaymentStrictReceive({
+        sendAsset: sourceAsset,
+        sendMax: this.computeSendMax(destinationAmount, lockedRate, toleranceBps),
+        destination: senderWallet,
+        destAsset: destinationAsset,
+        destAmount: destinationAmount,
+      });
+
+      const tx = new (StellarSdk as any).TransactionBuilder(sourceAccount, {
+        fee: '100',
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.withFailover(
+        (s) => s.prepareTransaction(tx),
+        'prepareTransaction',
+      );
+
+      const result = await this.withFailover(
+        (s) => s.sendTransaction(preparedTx),
+        'sendTransaction',
+      );
+
+      const txHash =
+        result?.hash ??
+        result?.id ??
+        result?.transactionHash ??
+        `path_payment_${Date.now()}`;
+
+      // Determine the effective rate from the result if available.
+      const effectiveRate = this.extractEffectiveRate(result, destinationAmount, lockedRate);
+
+      // Check if the effective rate is within the tolerance band.
+      if (!this.isRateWithinTolerance(lockedRate, effectiveRate, toleranceBps)) {
+        return {
+          outcome: PathPaymentOutcome.SLIPPAGE_EXCEEDED,
+          deliveredAmount: '0',
+          requestedAmount: destinationAmount,
+          effectiveRate,
+          lockedRate,
+          txHash,
+          reason: `Effective rate ${effectiveRate} deviates beyond ${toleranceBps} bps from locked rate ${lockedRate}`,
+        };
+      }
+
+      // Determine fill level from the result.
+      const delivered = this.extractDeliveredAmount(result, destinationAmount);
+      const deliveredNum = Number(delivered);
+      const requestedNum = Number(destinationAmount);
+
+      if (deliveredNum >= requestedNum) {
+        return {
+          outcome: PathPaymentOutcome.FULL_FILL,
+          deliveredAmount: delivered,
+          requestedAmount: destinationAmount,
+          effectiveRate,
+          lockedRate,
+          txHash,
+        };
+      }
+
+      return {
+        outcome: PathPaymentOutcome.PARTIAL_FILL,
+        deliveredAmount: delivered,
+        requestedAmount: destinationAmount,
+        effectiveRate,
+        lockedRate,
+        txHash,
+        reason: `Partial fill: delivered ${delivered} of ${destinationAmount} ${destinationAssetCode}`,
+      };
+    } catch (error) {
+      this.metricsService.incrementStellarTransaction(false);
+      const msg = error instanceof Error ? error.message : String(error);
+      const lowered = msg.toLowerCase();
+
+      // Slippage / tolerance exceeded is a distinct, handled outcome.
+      if (
+        lowered.includes('slippage') ||
+        lowered.includes('tolerance') ||
+        lowered.includes('price') ||
+        lowered.includes('offers')
+      ) {
+        return {
+          outcome: PathPaymentOutcome.SLIPPAGE_EXCEEDED,
+          deliveredAmount: '0',
+          requestedAmount: destinationAmount,
+          effectiveRate: lockedRate,
+          lockedRate,
+          reason: msg,
+        };
+      }
+
+      return {
+        outcome: PathPaymentOutcome.FAILED,
+        deliveredAmount: '0',
+        requestedAmount: destinationAmount,
+        effectiveRate: lockedRate,
+        lockedRate,
+        reason: msg,
+      };
+    }
+  }
+
+  /**
+   * Computes the maximum source amount to send for a path payment,
+   * given the locked rate and tolerance band.
+   */
+  private computeSendMax(
+    destinationAmount: string,
+    lockedRate: string,
+    toleranceBps: number,
+  ): string {
+    const dest = new Decimal(destinationAmount);
+    const rate = new Decimal(lockedRate);
+    if (rate.isZero()) return destinationAmount;
+
+    // source = dest / rate, then add tolerance buffer.
+    const source = dest.div(rate);
+    const buffer = new Decimal(1).plus(new Decimal(toleranceBps).div(10000));
+    return source.times(buffer).toFixed(7);
+  }
+
+  /**
+   * Extracts the effective rate from a path-payment result.
+   * Falls back to the locked rate if the result doesn't expose it.
+   */
+  private extractEffectiveRate(
+    result: any,
+    destinationAmount: string,
+    lockedRate: string,
+  ): string {
+    const sourceAmount = result?.sourceAmount ?? result?.sendAmount ?? result?.source_amount;
+    if (sourceAmount && Number(sourceAmount) > 0) {
+      const dest = new Decimal(destinationAmount);
+      const src = new Decimal(sourceAmount);
+      return dest.div(src).toFixed(7);
+    }
+    return lockedRate;
+  }
+
+  /**
+   * Extracts the delivered amount from a path-payment result.
+   * Falls back to the requested amount if not exposed.
+   */
+  private extractDeliveredAmount(result: any, destinationAmount: string): string {
+    const delivered =
+      result?.deliveredAmount ??
+      result?.destAmount ??
+      result?.destinationAmount ??
+      result?.amount_delivered;
+    if (delivered !== undefined && delivered !== null) {
+      return String(delivered);
+    }
+    return destinationAmount;
+  }
+
+  /**
+   * Checks whether an effective rate is within the tolerance band of a locked rate.
+   */
+  private isRateWithinTolerance(
+    lockedRate: string,
+    effectiveRate: string,
+    toleranceBps: number,
+  ): boolean {
+    const locked = new Decimal(lockedRate);
+    const effective = new Decimal(effectiveRate);
+    if (locked.isZero()) return false;
+
+    const deviation = effective.minus(locked).abs().div(locked);
+    const tolerance = new Decimal(toleranceBps).div(10000);
+    return deviation.lte(tolerance);
   }
 
   async deployRoscaContract(group: Group): Promise<string> {
