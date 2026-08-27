@@ -5,6 +5,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { JobFailure } from './entities/job-failure.entity';
 import { QUEUE_NAMES } from './queue.constants';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
 
 export interface JobFailureFilter {
   queueName?: string;
@@ -13,6 +14,7 @@ export interface JobFailureFilter {
   to?: string;
   page?: number;
   limit?: number;
+  isPoison?: boolean;
 }
 
 export interface BulkRetryFilter {
@@ -40,6 +42,7 @@ export class JobFailureService {
     @InjectQueue(QUEUE_NAMES.GROUP_SYNC) private readonly groupSyncQueue: Queue,
     @InjectQueue(QUEUE_NAMES.PAYOUT_RECONCILIATION)
     private readonly payoutQueue: Queue,
+    private readonly poisonMessageDetector: PoisonMessageDetectorService,
   ) {}
 
   private getQueueByName(queueName: string): Queue | undefined {
@@ -61,6 +64,12 @@ export class JobFailureService {
     data: Record<string, unknown> | null,
   ): Promise<void> {
     try {
+      // Check poison-message status for this job
+      const poisonStatus = this.poisonMessageDetector.getPoisonStatus(jobId);
+      const isPoison = poisonStatus?.consecutiveFailures !== undefined
+        ? poisonStatus.consecutiveFailures >= 3
+        : false;
+
       await this.repo.save(
         this.repo.create({
           jobId,
@@ -70,7 +79,11 @@ export class JobFailureService {
           stackTrace: error.stack ?? null,
           attemptNumber,
           data,
-          status: 'PENDING',
+          status: isPoison ? 'POISON' : 'PENDING',
+          isPoison,
+          consecutiveFailures: poisonStatus?.consecutiveFailures ?? 1,
+          failureSignature: poisonStatus?.signature ?? null,
+          errorClass: poisonStatus?.errorClass ?? error.constructor?.name ?? 'Error',
         }),
       );
     } catch (err) {
@@ -79,11 +92,12 @@ export class JobFailureService {
   }
 
   async findAll(filter: JobFailureFilter): Promise<{ data: JobFailure[]; total: number }> {
-    const { queueName, jobName, from, to, page = 1, limit = 20 } = filter;
+    const { queueName, jobName, from, to, page = 1, limit = 20, isPoison } = filter;
     const where: FindOptionsWhere<JobFailure> = {};
 
     if (queueName) where.queueName = queueName;
     if (jobName) where.jobName = jobName;
+    if (isPoison !== undefined) where.isPoison = isPoison;
     if (from || to) {
       where.failedAt = Between(
         from ? new Date(from) : new Date(0),
@@ -125,6 +139,8 @@ export class JobFailureService {
     });
 
     const updated = await this.repo.findOneOrFail({ where: { id } });
+    // Clear poison-message tracking since the job is being retried
+    this.poisonMessageDetector.clearJob(updated.jobId);
     return { record: updated, enqueuedJobId: String(newJob.id) };
   }
 
@@ -167,6 +183,9 @@ export class JobFailureService {
           lastRetriedAt: new Date(),
         });
 
+        // Clear poison-message tracking since the job is being retried
+        this.poisonMessageDetector.clearJob(record.jobId);
+
         this.logger.log(`Bulk-retried job failure ${record.id} → new job ${newJob.id}`);
         results.push({ id: record.id, success: true });
       } catch (err) {
@@ -193,6 +212,8 @@ export class JobFailureService {
         try {
           await job.retry();
           await this.repo.increment({ jobId: String(job.id) }, 'retryCount', 1);
+          // Clear poison-message tracking since the job is being retried
+          this.poisonMessageDetector.clearJob(String(job.id));
           retried++;
         } catch (err) {
           this.logger.warn(`Failed to retry job ${job.id}: ${(err as Error).message}`);
@@ -204,8 +225,9 @@ export class JobFailureService {
     return { retried };
   }
 
-  async getMetrics(): Promise<{ jobs_failed_total: number; jobs_failed_by_queue: Record<string, number> }> {
+  async getMetrics(): Promise<{ jobs_failed_total: number; jobs_failed_by_queue: Record<string, number>; poison_messages_total: number }> {
     const total = await this.repo.count();
+    const poisonTotal = await this.repo.count({ where: { isPoison: true } });
     const byQueue = await this.repo
       .createQueryBuilder('jf')
       .select('jf.queueName', 'queueName')
@@ -218,6 +240,10 @@ export class JobFailureService {
       jobs_failed_by_queue[row.queueName] = parseInt(row.count, 10);
     }
 
-    return { jobs_failed_total: total, jobs_failed_by_queue };
+    return {
+      jobs_failed_total: total,
+      jobs_failed_by_queue,
+      poison_messages_total: poisonTotal,
+    };
   }
 }

@@ -3,6 +3,7 @@ import { getQueueToken } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { QueueService } from './queue.service';
 import { QUEUE_NAMES, JOB_NAMES } from './queue.constants';
+import { CircuitBreakerAwareBackoffService } from './circuit-breaker-aware-backoff.service';
 
 // Factory to create a full mock Queue
 function makeMockQueue(name: string): jest.Mocked<Queue> {
@@ -17,6 +18,12 @@ function makeMockQueue(name: string): jest.Mocked<Queue> {
     isPaused: jest.fn().mockResolvedValue(false),
   } as unknown as jest.Mocked<Queue>;
 }
+
+const mockBackoffService = {
+  getBackoffDelay: jest.fn().mockReturnValue(5000),
+  recordFailure: jest.fn(),
+  recordSuccess: jest.fn(),
+};
 
 describe('QueueService', () => {
   let service: QueueService;
@@ -55,6 +62,22 @@ describe('QueueService', () => {
           provide: getQueueToken(QUEUE_NAMES.DEAD_LETTER),
           useValue: deadLetterQueue,
         },
+        {
+          provide: getQueueToken(QUEUE_NAMES.TX_CONFIRMATION),
+          useValue: makeMockQueue(QUEUE_NAMES.TX_CONFIRMATION),
+        },
+        {
+          provide: getQueueToken(QUEUE_NAMES.PUSH_NOTIFICATION),
+          useValue: makeMockQueue(QUEUE_NAMES.PUSH_NOTIFICATION),
+        },
+        {
+          provide: getQueueToken(QUEUE_NAMES.TRUST_SCORE),
+          useValue: makeMockQueue(QUEUE_NAMES.TRUST_SCORE),
+        },
+        {
+          provide: CircuitBreakerAwareBackoffService,
+          useValue: mockBackoffService,
+        },
       ],
     }).compile();
 
@@ -83,7 +106,12 @@ describe('QueueService', () => {
     });
 
     it('addSendNotificationEmail should call emailQueue.add', async () => {
-      const data = { ...emailData, userId: 'u1', notificationType: 'INVITE' };
+      const data = {
+        ...emailData,
+        userId: 'u1',
+        notificationType: 'INVITE',
+        body: 'You have been invited',
+      };
       await service.addSendNotificationEmail(data);
       expect(emailQueue.add).toHaveBeenCalledWith(
         JOB_NAMES.SEND_NOTIFICATION_EMAIL,
@@ -178,7 +206,7 @@ describe('QueueService', () => {
       await service.addSyncGroupState(data);
       expect(groupSyncQueue.add).toHaveBeenCalledWith(
         JOB_NAMES.SYNC_GROUP_STATE,
-        data,
+        expect.objectContaining({ groupId: 'g1' }),
         expect.objectContaining({ jobId: 'g1' }),
       );
     });
@@ -240,16 +268,47 @@ describe('QueueService', () => {
   // getQueues()
   // ---------------------------------------------------------------------------
   describe('getQueues()', () => {
-    it('should return all four queues', () => {
+    it('should return all queues', () => {
       const queues = service.getQueues();
-      expect(queues).toHaveLength(5);
+      expect(queues).toHaveLength(7);
       expect(queues.map((q) => q.name)).toEqual([
         QUEUE_NAMES.EMAIL,
         QUEUE_NAMES.EVENT_SYNC,
         QUEUE_NAMES.GROUP_SYNC,
         QUEUE_NAMES.PAYOUT_RECONCILIATION,
         QUEUE_NAMES.DEAD_LETTER,
+        QUEUE_NAMES.TX_CONFIRMATION,
+        QUEUE_NAMES.PUSH_NOTIFICATION,
       ]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Circuit-breaker-aware backoff
+  // ---------------------------------------------------------------------------
+  describe('circuit-breaker-aware backoff', () => {
+    it('getBackoffDelay should delegate to backoff service', () => {
+      service.getBackoffDelay('stellar-rpc', 2);
+      expect(mockBackoffService.getBackoffDelay).toHaveBeenCalledWith(
+        'stellar-rpc',
+        2,
+      );
+    });
+
+    it('recordBackoffFailure should delegate to backoff service', () => {
+      const error = new Error('RPC timeout');
+      service.recordBackoffFailure('stellar-rpc', error);
+      expect(mockBackoffService.recordFailure).toHaveBeenCalledWith(
+        'stellar-rpc',
+        error,
+      );
+    });
+
+    it('recordBackoffSuccess should delegate to backoff service', () => {
+      service.recordBackoffSuccess('stellar-rpc');
+      expect(mockBackoffService.recordSuccess).toHaveBeenCalledWith(
+        'stellar-rpc',
+      );
     });
   });
 });

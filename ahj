@@ -1,0 +1,304 @@
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Param,
+  Query,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+  Request,
+  ForbiddenException,
+  NotFoundException,
+  UseInterceptors,
+} from '@nestjs/common';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+  ApiParam,
+  ApiBody,
+} from '@nestjs/swagger';
+import { IsArray, IsDateString, IsOptional, IsString, IsUUID } from 'class-validator';
+import { QueueService, AllQueueStats } from './queue.service';
+import { JobFailureService, BulkRetryFilter } from './job-failure.service';
+import { PoisonMessageDetectorService } from './poison-message-detector.service';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+import { CircuitBreakerAwareBackoffService } from './circuit-breaker-aware-backoff.service';
+import { AuditService } from '../audit/audit.service';
+import { JwtAuthGuard } from '../stellar-auth/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { PaginationDto, PaginatedResponseDto } from '../common/dto/pagination.dto';
+import { PaginationLinkHeaderInterceptor } from '../common/interceptors/pagination-link-header.interceptor';
+
+class BulkRetryDto implements BulkRetryFilter {
+  @IsOptional()
+  @IsArray()
+  @IsUUID('all', { each: true })
+  ids?: string[];
+
+  @IsOptional()
+  @IsString()
+  queueName?: string;
+
+  @IsOptional()
+  @IsString()
+  errorType?: string;
+
+  @IsOptional()
+  @IsDateString()
+  createdBefore?: string;
+}
+
+@ApiTags('Admin – Queue')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles('admin')
+@Controller({ path: 'admin/queue', version: '1' })
+export class QueueAdminController {
+  constructor(
+    private readonly queueService: QueueService,
+    private readonly jobFailureService: JobFailureService,
+    private readonly poisonMessageDetector: PoisonMessageDetectorService,
+    private readonly deadLetterAlerting: DeadLetterAlertingService,
+    private readonly circuitBreakerBackoff: CircuitBreakerAwareBackoffService,
+    private readonly auditService: AuditService,
+  ) {}
+
+  @Get('stats')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get queue depths and failed-job counts (admin only)' })
+  @ApiResponse({ status: 200, description: 'Queue statistics for all queues including the dead-letter queue' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getStats(): Promise<AllQueueStats> {
+    return this.queueService.getStats();
+  }
+
+  @Get('dead-letter')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(PaginationLinkHeaderInterceptor)
+  @ApiOperation({ summary: 'Get dead letter queue jobs (admin only)' })
+  @ApiResponse({ status: 200, description: 'Dead letter queue jobs retrieved successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getDeadLetterJobs(@Query() pagination: PaginationDto) {
+    const { page = 1, limit = 20 } = pagination;
+    const all = await this.queueService.getDeadLetterJobs();
+    const start = (page - 1) * limit;
+    const data = all.slice(start, start + limit);
+    return PaginatedResponseDto.of(data, all.length, page, limit);
+  }
+
+  /**
+   * GET /admin/queue/poison-messages
+   * Returns all currently tracked poison-message candidates.
+   */
+  @Get('poison-messages')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get poison-message candidates (admin only)' })
+  @ApiResponse({ status: 200, description: 'Poison-message candidates retrieved' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async getPoisonMessages() {
+    const candidates = this.poisonMessageDetector.getAllPoisonCandidates();
+    return {
+      success: true,
+      data: candidates,
+      total: candidates.length,
+    };
+  }
+
+  /**
+   * GET /admin/queue/poison-messages/:jobId
+   * Returns the poison-message status for a specific job.
+   */
+  @Get('poison-messages/:jobId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get poison-message status for a job (admin only)' })
+  @ApiParam({ name: 'jobId', description: 'The BullMQ job ID' })
+  @ApiResponse({ status: 200, description: 'Poison-message status retrieved' })
+  @ApiResponse({ status: 404, description: 'Job not found in poison-message tracker' })
+  async getPoisonMessageStatus(@Param('jobId') jobId: string) {
+    const status = this.poisonMessageDetector.getPoisonStatus(jobId);
+    if (!status) {
+      throw new NotFoundException(`Job ${jobId} not found in poison-message tracker`);
+    }
+    return { success: true, data: status };
+  }
+
+  /**
+   * POST /admin/queue/poison-messages/:jobId/clear
+   * Clears the poison-message tracking for a job.
+   */
+  @Post('poison-messages/:jobId/clear')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Clear poison-message tracking for a job (admin only)' })
+  @ApiParam({ name: 'jobId', description: 'The BullMQ job ID' })
+  @ApiResponse({ status: 200, description: 'Poison-message tracking cleared' })
+  async clearPoisonMessage(
+    @Param('jobId') jobId: string,
+    @Request() req: any,
+  ) {
+    this.poisonMessageDetector.clearJob(jobId);
+
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_POISON_MESSAGE_CLEAR',
+      resource: 'poison_messages',
+      metadata: { jobId },
+    });
+
+    return { success: true, message: `Poison-message tracking cleared for job ${jobId}` };
+  }
+
+  /**
+   * GET /admin/queue/dead-letter/volume
+   * Returns dead-letter volume states for all queues.
+   */
+  @Get('dead-letter/volume')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get dead-letter volume states (admin only)' })
+  @ApiResponse({ status: 200, description: 'Dead-letter volume states retrieved' })
+  async getDeadLetterVolume() {
+    const states = this.deadLetterAlerting.getAllVolumeStates();
+    return {
+      success: true,
+      data: states,
+      total: states.length,
+    };
+  }
+
+  /**
+   * GET /admin/queue/backoff-states
+   * Returns circuit-breaker-aware backoff states for all downstreams.
+   */
+  @Get('backoff-states')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Get circuit-breaker-aware backoff states (admin only)' })
+  @ApiResponse({ status: 200, description: 'Backoff states retrieved' })
+  async getBackoffStates() {
+    const states = this.circuitBreakerBackoff.getAllDownstreamStates();
+    return {
+      success: true,
+      data: states,
+      total: states.length,
+    };
+  }
+
+  /**
+   * POST /admin/queue/backoff-states/:downstream/reset
+   * Resets the backoff state for a specific downstream.
+   */
+  @Post('backoff-states/:downstream/reset')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Reset backoff state for a downstream (admin only)' })
+  @ApiParam({ name: 'downstream', description: 'Downstream dependency name (e.g. stellar-rpc)' })
+  @ApiResponse({ status: 200, description: 'Backoff state reset' })
+  async resetBackoffState(
+    @Param('downstream') downstream: string,
+    @Request() req: any,
+  ) {
+    this.circuitBreakerBackoff.resetDownstream(downstream);
+
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_BACKOFF_STATE_RESET',
+      resource: 'backoff_states',
+      metadata: { downstream },
+    });
+
+    return { success: true, message: `Backoff state reset for downstream=${downstream}` };
+  }
+
+  /**
+   * POST /admin/dead-letter/:id/retry
+   * Re-enqueues a single job from the dead-letter records and marks it RETRYING.
+   */
+  @Post('dead-letter/:id/retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Retry a single dead-letter job by its record ID (admin only)' })
+  @ApiParam({ name: 'id', description: 'UUID of the JobFailure record' })
+  @ApiResponse({ status: 200, description: 'Job re-enqueued successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  @ApiResponse({ status: 404, description: 'Job failure record not found' })
+  async retryDeadLetterJob(
+    @Param('id') id: string,
+    @Request() req: any,
+  ) {
+    let result: Awaited<ReturnType<typeof this.jobFailureService.retryById>>;
+    try {
+      result = await this.jobFailureService.retryById(id);
+    } catch (err) {
+      if ((err as Error).message?.includes('Could not find any entity')) {
+        throw new NotFoundException(`JobFailure record ${id} not found`);
+      }
+      throw err;
+    }
+
+    const adminUserId: string = req.user?.id ?? 'unknown';
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_DEAD_LETTER_RETRY',
+      resource: 'job_failures',
+      metadata: {
+        recordId: id,
+        queueName: result.record.queueName,
+        jobName: result.record.jobName,
+        originalJobId: result.record.jobId,
+        enqueuedJobId: result.enqueuedJobId,
+      },
+    });
+
+    return {
+      success: true,
+      recordId: id,
+      enqueuedJobId: result.enqueuedJobId,
+      status: result.record.status,
+      retryCount: result.record.retryCount,
+    };
+  }
+
+  /**
+   * POST /admin/dead-letter/bulk-retry
+   * Accepts either an array of IDs or a filter {queueName, errorType, createdBefore}.
+   */
+  @Post('dead-letter/bulk-retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Bulk retry dead-letter jobs by IDs or filter (admin only)' })
+  @ApiBody({ type: BulkRetryDto })
+  @ApiResponse({ status: 200, description: 'Bulk retry results' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async bulkRetryDeadLetterJobs(
+    @Body() dto: BulkRetryDto,
+    @Request() req: any,
+  ) {
+    const result = await this.jobFailureService.bulkRetry(dto);
+    const adminUserId: string = req.user?.id ?? 'unknown';
+
+    await this.auditService.createLog({
+      userId: adminUserId,
+      action: 'ADMIN_DEAD_LETTER_BULK_RETRY',
+      resource: 'job_failures',
+      metadata: {
+        filter: dto,
+        total: result.total,
+        succeeded: result.results.filter((r) => r.success).length,
+        failed: result.results.filter((r) => !r.success).length,
+      },
+    });
+
+    return result;
+  }
+
+  @Post('retry')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Retry a failed job from dead letter queue (admin only)' })
+  @ApiResponse({ status: 200, description: 'Job retry initiated successfully' })
+  @ApiResponse({ status: 403, description: 'Forbidden - Admin role required' })
+  async retryJob(@Body() body: { jobId: string }) {
+    return this.queueService.retryDeadLetterJob(body.jobId);
+  }
+}

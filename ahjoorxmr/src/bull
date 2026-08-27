@@ -1,0 +1,118 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
+import { DeadLetterAlertingService } from './dead-letter-alerting.service';
+
+const mockConfigService = {
+  get: jest.fn((key: string, defaultValue?: any) => {
+    const config: Record<string, any> = {
+      DEAD_LETTER_ALERT_THRESHOLD: 3,
+      DEAD_LETTER_ALERT_WINDOW_MS: 60 * 60 * 1000,
+      DEAD_LETTER_ALERT_WEBHOOK_URL: undefined,
+    };
+    return config[key] ?? defaultValue;
+  }),
+};
+
+describe('DeadLetterAlertingService', () => {
+  let service: DeadLetterAlertingService;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        DeadLetterAlertingService,
+        { provide: ConfigService, useValue: mockConfigService },
+      ],
+    }).compile();
+
+    service = module.get(DeadLetterAlertingService);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+    service.resetAll();
+  });
+
+  it('should be defined', () => {
+    expect(service).toBeDefined();
+  });
+
+  describe('recordDeadLetter()', () => {
+    it('should not trigger alert below threshold', () => {
+      const triggered = service.recordDeadLetter(
+        'email-queue',
+        'send-email',
+        new Error('SMTP error'),
+      );
+      expect(triggered).toBe(false);
+
+      const state = service.getVolumeState('email-queue');
+      expect(state?.count).toBe(1);
+    });
+
+    it('should trigger alert when threshold is crossed', () => {
+      // Use threshold = 3
+      let triggered = false;
+      for (let i = 0; i < 2; i++) {
+        triggered = service.recordDeadLetter(
+          'email-queue',
+          'send-email',
+          new Error('SMTP error'),
+        );
+      }
+      expect(triggered).toBe(false);
+
+      // Third dead-letter should trigger the alert
+      triggered = service.recordDeadLetter(
+        'email-queue',
+        'send-email',
+        new Error('SMTP error'),
+      );
+      expect(triggered).toBe(true);
+
+      const state = service.getVolumeState('email-queue');
+      expect(state?.count).toBe(3);
+      expect(state?.alertSent).toBe(true);
+    });
+
+    it('should only trigger once per window', () => {
+      for (let i = 0; i < 6; i++) {
+        service.recordDeadLetter(
+          'email-queue',
+          'send-email',
+          new Error('SMTP error'),
+        );
+      }
+
+      const state = service.getVolumeState('email-queue');
+      expect(state?.count).toBe(6);
+      expect(state?.alertSent).toBe(true);
+
+      // More dead-letters in the same window should not re-trigger
+      const triggered = service.recordDeadLetter(
+        'email-queue',
+        'send-email',
+        new Error('SMTP error'),
+      );
+      expect(triggered).toBe(false);
+    });
+  });
+
+  describe('getAllVolumeStates()', () => {
+    it('should return all tracked queues', () => {
+      service.recordDeadLetter('email-queue', 'send-email', new Error('SMTP'));
+      service.recordDeadLetter('push-queue', 'send-push', new Error('FCM'));
+
+      const states = service.getAllVolumeStates();
+      expect(states).toHaveLength(2);
+    });
+  });
+
+  describe('resetQueue()', () => {
+    it('should remove queue state', () => {
+      service.recordDeadLetter('email-queue', 'send-email', new Error('SMTP'));
+      service.resetQueue('email-queue');
+
+      expect(service.getVolumeState('email-queue')).toBeUndefined();
+    });
+  });
+});

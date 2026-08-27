@@ -1,6 +1,6 @@
 import { Entity, Column, PrimaryGeneratedColumn, CreateDateColumn, UpdateDateColumn, Index } from 'typeorm';
 
-export type JobFailureStatus = 'PENDING' | 'RETRYING' | 'RESOLVED';
+export type JobFailureStatus = 'PENDING' | 'RETRYING' | 'RESOLVED' | 'POISON';
 
 @Entity('job_failures')
 @Index(['queueName', 'failedAt'])
@@ -49,4 +49,20 @@ export class JobFailure {
 
   @Column({ type: 'timestamptz', nullable: true })
   lastRetriedAt: Date | null;
+
+  /** Set to true when the job was classified as a poison message */
+  @Column('boolean', { default: false })
+  isPoison: boolean;
+
+  /** Number of consecutive failures with the same error signature */
+  @Column('int', { default: 0 })
+  consecutiveFailures: number;
+
+  /** SHA-256 signature of (errorClass + payload) used for poison detection */
+  @Column('varchar', { length: 64, nullable: true })
+  failureSignature: string | null;
+
+  /** Error class name (e.g. 'Error', 'ServiceUnavailableException') */
+  @Column('varchar', { length: 128, nullable: true })
+  errorClass: string | null;
 }
