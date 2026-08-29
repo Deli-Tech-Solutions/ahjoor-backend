@@ -23,7 +23,9 @@
     "migration:run": "ts-node --project tsconfig.migration.json scripts/run-migrations.ts",
     "migration:revert": "ts-node --project tsconfig.migration.json scripts/revert-migration.ts",
     "seed": "ts-node --project tsconfig.json scripts/seed.ts",
-    "seed:reset": "ts-node --project tsconfig.json scripts/seed-reset.ts"
+    "seed:reset": "ts-node --project tsconfig.json scripts/seed-reset.ts",
+    "encryption:encrypt-existing": "ts-node --project tsconfig.migration.json scripts/encrypt-existing-records.ts",
+    "encryption:rotate-keys": "ts-node --project tsconfig.migration.json scripts/rotate-encryption-keys.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1036.0",
