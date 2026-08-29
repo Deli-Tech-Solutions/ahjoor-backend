@@ -4,6 +4,7 @@ import {
   HttpException,
   HttpStatus,
   Logger,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   ThrottlerGuard,
@@ -17,6 +18,7 @@ import type {
   ThrottlerModuleOptions,
 } from '@nestjs/throttler';
 import { Reflector } from '@nestjs/core';
+import { createHash } from 'crypto';
 import { Request } from 'express';
 import { TrustedIpService } from '../services/trusted-ip.service';
 import {
@@ -25,10 +27,11 @@ import {
   THROTTLE_BYPASS_KEY,
   RateLimitConfig,
 } from '../decorators/rate-limit.decorator';
+import { getApiKeyThrottleLimits } from '../throttler.config';
 
 /**
  * Enhanced throttler guard with IP-based rate limiting,
- * trusted IP bypass, and custom rate limit configurations
+ * trusted IP bypass, API-key + IP/user AND composition, and fail-closed Redis.
  */
 @Injectable()
 export class CustomThrottlerGuard extends ThrottlerGuard {
@@ -45,13 +48,9 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
     super(options, storageService, reflector);
   }
 
-  /**
-   * Main guard logic with trusted IP bypass and IP blocking checks
-   */
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<Request>();
 
-    // Check if rate limiting should be skipped for this endpoint
     const skipRateLimit = this.reflector.getAllAndOverride<boolean>(
       THROTTLE_SKIP_KEY,
       [context.getHandler(), context.getClass()],
@@ -62,26 +61,36 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
       return true;
     }
 
-    // Extract IP address
     const ip = this.extractIp(request);
     this.logger.debug(`Request from IP: ${ip} to ${request.path}`);
 
-    // Check if IP is blocked
-    const blockStatus = await this.trustedIpService.isIpBlocked(ip);
-    if (blockStatus.blocked) {
-      this.logger.warn(`Blocked IP ${ip} attempted to access ${request.path}`);
-      throw new HttpException(
-        {
-          statusCode: HttpStatus.FORBIDDEN,
-          message: `Access denied: ${blockStatus.reason}`,
-          error: 'Forbidden',
-          blockedUntil: await this.getBlockExpiry(ip),
-        },
-        HttpStatus.FORBIDDEN,
+    try {
+      const blockStatus = await this.trustedIpService.isIpBlocked(ip);
+      if (blockStatus.blocked) {
+        this.logger.warn(`Blocked IP ${ip} attempted to access ${request.path}`);
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.FORBIDDEN,
+            message: `Access denied: ${blockStatus.reason}`,
+            error: 'Forbidden',
+            blockedUntil: await this.getBlockExpiry(ip),
+          },
+          HttpStatus.FORBIDDEN,
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      this.logger.error(
+        `rate_limit_redis_unavailable (block check): ${(error as Error).message}`,
       );
+      throw new ServiceUnavailableException({
+        statusCode: 503,
+        error: 'Service Unavailable',
+        message:
+          'Rate limiting temporarily unavailable. Request rejected (fail-closed).',
+      });
     }
 
-    // Check if IP is trusted and bypass is allowed
     const allowBypass = this.reflector.getAllAndOverride<boolean>(
       THROTTLE_BYPASS_KEY,
       [context.getHandler(), context.getClass()],
@@ -94,25 +103,23 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
       return true;
     }
 
-    // Get custom rate limit configuration for this endpoint
     const customConfig = this.reflector.getAllAndOverride<RateLimitConfig>(
       THROTTLE_CONFIG_KEY,
       [context.getHandler(), context.getClass()],
     );
 
-    // Store rate limit config in request for later use
     if (customConfig) {
       (request as any).rateLimitConfig = customConfig;
     }
 
     try {
-      // Execute parent throttler logic
-      const canActivate = await super.canActivate(context);
-      return canActivate;
+      return await super.canActivate(context);
     } catch (error) {
-      // Handle rate limit exceeded
+      if (error instanceof ServiceUnavailableException) {
+        throw error;
+      }
+
       if (error instanceof ThrottlerException) {
-        // Increment violation counter
         const { count, shouldBlock } =
           await this.trustedIpService.incrementViolations(ip);
 
@@ -120,7 +127,6 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
           `Rate limit exceeded for IP ${ip} on ${request.path} (${count} violations)`,
         );
 
-        // If violations exceed threshold, IP will be blocked
         if (shouldBlock) {
           throw new HttpException(
             {
@@ -134,7 +140,6 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
           );
         }
 
-        // Throw custom message if configured
         const customMessage = customConfig?.message;
         if (customMessage) {
           throw new HttpException(
@@ -150,7 +155,6 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
           );
         }
 
-        // Re-throw original exception
         throw error;
       }
 
@@ -159,56 +163,151 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
   }
 
   /**
-   * Extract IP address from request with proxy support
+   * Enforce IP/user bucket AND API-key bucket when X-Api-Key is present.
+   * Effective limit is the stricter of the two (AND), not the looser (OR).
    */
+  protected async handleRequest(requestProps: any): Promise<boolean> {
+    const {
+      context,
+      limit,
+      ttl,
+      throttler,
+      blockDuration,
+      getTracker,
+      generateKey,
+    } = requestProps;
+    const { req, res } = this.getRequestResponse(context);
+
+    const ignoreUserAgents =
+      throttler.ignoreUserAgents ??
+      (this as any).commonOptions?.ignoreUserAgents;
+    if (Array.isArray(ignoreUserAgents)) {
+      for (const pattern of ignoreUserAgents) {
+        if (pattern.test(req.headers['user-agent'])) {
+          return true;
+        }
+      }
+    }
+
+    const tracker = await getTracker(req, context);
+    const key = generateKey(context, tracker, throttler.name);
+    const primary = await this.storageService.increment(
+      key,
+      ttl,
+      limit,
+      blockDuration,
+      throttler.name,
+    );
+
+    const apiKeyHeader = req.headers['x-api-key'] as string | undefined;
+    let apiKeyRecord: Awaited<ReturnType<ThrottlerStorage['increment']>> | null =
+      null;
+
+    if (apiKeyHeader && throttler.name === 'default') {
+      const apiLimits = getApiKeyThrottleLimits();
+      const apiTracker = `apikey:${createHash('sha256')
+        .update(apiKeyHeader)
+        .digest('hex')
+        .slice(0, 32)}`;
+      const apiKey = generateKey(
+        context,
+        apiTracker,
+        `${throttler.name}:apikey`,
+      );
+      apiKeyRecord = await this.storageService.increment(
+        apiKey,
+        apiLimits.ttl,
+        apiLimits.limit,
+        blockDuration,
+        throttler.name,
+      );
+    }
+
+    const isBlocked = primary.isBlocked || Boolean(apiKeyRecord?.isBlocked);
+    const getThrottlerSuffix = (name: string) =>
+      name === 'default' ? '' : `-${name}`;
+    const setHeaders = throttler.setHeaders ?? true;
+    const headerPrefix = (this as any).headerPrefix ?? 'X-RateLimit';
+
+    if (isBlocked) {
+      const retryAfter =
+        apiKeyRecord?.isBlocked && !primary.isBlocked
+          ? apiKeyRecord.timeToBlockExpire
+          : primary.timeToBlockExpire;
+      if (setHeaders) {
+        res.header(
+          `Retry-After${getThrottlerSuffix(throttler.name)}`,
+          String(retryAfter),
+        );
+      }
+      await this.throwThrottlingException(context, {
+        limit,
+        ttl,
+        key,
+        tracker,
+        totalHits: Math.max(primary.totalHits, apiKeyRecord?.totalHits ?? 0),
+        timeToExpire: primary.timeToExpire,
+        isBlocked: true,
+        timeToBlockExpire: retryAfter,
+      });
+    }
+
+    if (setHeaders) {
+      const primaryRemaining = Math.max(0, limit - primary.totalHits);
+      const apiRemaining = apiKeyRecord
+        ? Math.max(0, getApiKeyThrottleLimits().limit - apiKeyRecord.totalHits)
+        : primaryRemaining;
+      const remaining = Math.min(primaryRemaining, apiRemaining);
+      res.header(
+        `${headerPrefix}-Limit${getThrottlerSuffix(throttler.name)}`,
+        limit,
+      );
+      res.header(
+        `${headerPrefix}-Remaining${getThrottlerSuffix(throttler.name)}`,
+        remaining,
+      );
+      res.header(
+        `${headerPrefix}-Reset${getThrottlerSuffix(throttler.name)}`,
+        primary.timeToExpire,
+      );
+    }
+
+    return true;
+  }
+
   protected extractIp(req: Request): string {
-    // Check X-Forwarded-For header (proxy/load balancer)
     const forwardedFor = req.headers['x-forwarded-for'];
     if (forwardedFor) {
       const ips = (forwardedFor as string).split(',').map((ip) => ip.trim());
-      return ips[0]; // Use the first IP (client's real IP)
+      return ips[0];
     }
 
-    // Check X-Real-IP header (nginx)
     const realIp = req.headers['x-real-ip'];
     if (realIp) {
       return realIp as string;
     }
 
-    // Check CF-Connecting-IP (Cloudflare)
     const cfIp = req.headers['cf-connecting-ip'];
     if (cfIp) {
       return cfIp as string;
     }
 
-    // Fall back to socket IP
     return req.ip || req.socket?.remoteAddress || 'unknown';
   }
 
-  /**
-   * Get tracker key for rate limiting.
-   * Uses IP + User-Agent fingerprint to prevent trivial bypass by cycling IPs.
-   * Falls back to user ID for authenticated requests.
-   */
   protected async getTracker(req: Request): Promise<string> {
     const user = (req as any).user;
-    if (user?.id) {
+    if (user?.id && !user?.apiKeyId) {
       return `user:${user.id}`;
     }
-
     const ip = this.extractIp(req);
     const ua = (req.headers['user-agent'] ?? 'unknown').slice(0, 128);
-    // Combine IP + UA so cycling one alone doesn't reset the counter
     return `ip:${ip}:ua:${Buffer.from(`${ip}:${ua}`).toString('base64').slice(0, 32)}`;
   }
 
-  /**
-   * Get throttler limit based on custom config, user authentication, or defaults
-   */
   protected getThrottlerLimit(context: ExecutionContext): number {
     const request = context.switchToHttp().getRequest();
 
-    // Check for custom configuration
     const customConfig = this.reflector.getAllAndOverride<RateLimitConfig>(
       THROTTLE_CONFIG_KEY,
       [context.getHandler(), context.getClass()],
@@ -218,18 +317,14 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
       return customConfig.limit;
     }
 
-    // Check if user is authenticated
     const user = request.user;
     if (user && user.id) {
-      return 200; // Higher limit for authenticated users
+      return 200;
     }
 
-    return 100; // Default limit for anonymous users
+    return 100;
   }
 
-  /**
-   * Get throttler TTL based on custom config or defaults
-   */
   protected getThrottlerTtl(context: ExecutionContext): number {
     const customConfig = this.reflector.getAllAndOverride<RateLimitConfig>(
       THROTTLE_CONFIG_KEY,
@@ -240,28 +335,24 @@ export class CustomThrottlerGuard extends ThrottlerGuard {
       return customConfig.ttl;
     }
 
-    return 60000; // Default: 1 minute
+    return 60000;
   }
 
-  /**
-   * Get block expiry timestamp for blocked IP
-   */
-  private async getBlockExpiry(ip: string): Promise<number> {
-    // This would need Redis TTL check - simplified here
-    return Date.now() + 3600000; // 1 hour default
+  private async getBlockExpiry(_ip: string): Promise<number> {
+    return Date.now() + 3600000;
   }
 
-  /**
-   * Override throwThrottlingException to ensure Retry-After header is always set correctly
-   */
   protected async throwThrottlingException(
     context: ExecutionContext,
     throttlerLimitDetail: ThrottlerLimitDetail,
   ): Promise<void> {
     const { res } = this.getRequestResponse(context);
-    const waitTime = Math.ceil(throttlerLimitDetail.timeToExpire);
+    const waitTime = Math.ceil(
+      throttlerLimitDetail.timeToExpire ||
+        throttlerLimitDetail.timeToBlockExpire ||
+        1,
+    );
 
-    // Set standard Retry-After header in seconds
     res.header('Retry-After', waitTime.toString());
 
     throw new ThrottlerException(

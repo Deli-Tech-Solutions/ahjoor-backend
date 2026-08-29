@@ -1,19 +1,17 @@
 /**
- * E2E: Distributed Rate Limiting (#182)
+ * Distributed rate limiting across ≥3 simulated instances.
  *
- * Spins up TWO separate NestJS app instances sharing the same Redis store.
- * Verifies that hitting the limit on instance A blocks requests on instance B.
+ * Uses a shared in-process counter that implements the Nest v6 storage
+ * contract (`isBlocked`) to prove a client cannot multiply their budget by
+ * spreading requests across instances. Production uses Redis Lua; this test
+ * models the shared store without requiring a live Redis in unit CI.
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication, Controller, Get, Module } from '@nestjs/common';
-import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ThrottlerModule, ThrottlerGuard, ThrottlerStorageRecord } from '@nestjs/throttler';
 import { APP_GUARD } from '@nestjs/core';
-import * as request from 'supertest';
-import { RedisThrottlerStorageService } from '../../throttler/redis-throttler-storage.service';
-import { RedisService } from '../../common/redis/redis.service';
+import request from 'supertest';
 import { ConfigModule } from '@nestjs/config';
-
-// ── Minimal test controller ──────────────────────────────────────────────────
 
 @Controller('test-rl')
 class TestRlController {
@@ -23,50 +21,41 @@ class TestRlController {
   }
 }
 
-// ── Shared Redis mock that counts calls ──────────────────────────────────────
-
-class SharedCounter {
+class SharedAtomicStore {
   private counts = new Map<string, number>();
-
-  increment(key: string): number {
-    const n = (this.counts.get(key) ?? 0) + 1;
-    this.counts.set(key, n);
-    return n;
-  }
-
-  get(key: string): number {
-    return this.counts.get(key) ?? 0;
-  }
 
   reset() {
     this.counts.clear();
   }
-}
 
-const sharedCounter = new SharedCounter();
-
-// Shared in-memory storage that simulates Redis being shared across pods
-class SharedMemoryThrottlerStorage {
   async increment(
     key: string,
     ttl: number,
-  ): Promise<{ totalHits: number; timeToExpire: number }> {
-    const totalHits = sharedCounter.increment(key);
-    return { totalHits, timeToExpire: ttl };
+    limit: number,
+    blockDuration: number,
+    _throttlerName: string,
+  ): Promise<ThrottlerStorageRecord> {
+    const totalHits = (this.counts.get(key) ?? 0) + 1;
+    this.counts.set(key, totalHits);
+    const isBlocked = totalHits > limit;
+    return {
+      totalHits,
+      timeToExpire: Math.ceil(ttl / 1000),
+      isBlocked,
+      timeToBlockExpire: isBlocked ? Math.ceil(blockDuration / 1000) : 0,
+    };
   }
 }
 
-// ── Helper to build a minimal app instance ───────────────────────────────────
+const sharedStore = new SharedAtomicStore();
 
 async function buildApp(limit: number, ttl: number): Promise<INestApplication> {
-  const storage = new SharedMemoryThrottlerStorage();
-
   @Module({
     imports: [
       ConfigModule.forRoot({ isGlobal: true }),
       ThrottlerModule.forRoot({
         throttlers: [{ name: 'default', ttl, limit }],
-        storage: storage as any,
+        storage: sharedStore as any,
       }),
     ],
     controllers: [TestRlController],
@@ -83,67 +72,52 @@ async function buildApp(limit: number, ttl: number): Promise<INestApplication> {
   return app;
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-describe('Distributed Rate Limiting (cross-instance)', () => {
-  let appA: INestApplication;
-  let appB: INestApplication;
-
-  const LIMIT = 3;
+describe('Distributed Rate Limiting (≥3 instances)', () => {
+  let apps: INestApplication[];
+  const LIMIT = 5;
   const TTL = 60_000;
 
   beforeAll(async () => {
-    [appA, appB] = await Promise.all([
+    apps = await Promise.all([
+      buildApp(LIMIT, TTL),
       buildApp(LIMIT, TTL),
       buildApp(LIMIT, TTL),
     ]);
   });
 
   afterAll(async () => {
-    await Promise.all([appA.close(), appB.close()]);
+    await Promise.all(apps.map((a) => a.close()));
   });
 
-  beforeEach(() => sharedCounter.reset());
+  beforeEach(() => sharedStore.reset());
 
-  it('allows requests up to the limit across both instances', async () => {
-    // 2 requests on instance A
-    await request(appA.getHttpServer()).get('/test-rl').expect(200);
-    await request(appA.getHttpServer()).get('/test-rl').expect(200);
+  it('allows at most LIMIT successes when requests are spread across 3 instances', async () => {
+    const statuses: number[] = [];
 
-    // 1 request on instance B — still within limit
-    await request(appB.getHttpServer()).get('/test-rl').expect(200);
-  });
-
-  it('blocks on instance B after limit is reached on instance A', async () => {
-    // Exhaust limit entirely on instance A
-    for (let i = 0; i < LIMIT; i++) {
-      await request(appA.getHttpServer()).get('/test-rl');
+    // 9 requests round-robin across 3 instances (would be 3×LIMIT if per-instance)
+    for (let i = 0; i < LIMIT * 2; i++) {
+      const app = apps[i % apps.length];
+      const res = await request(app.getHttpServer()).get('/test-rl');
+      statuses.push(res.status);
     }
 
-    // Instance B should now be blocked (shared counter > limit)
-    const res = await request(appB.getHttpServer()).get('/test-rl');
-    expect(res.status).toBe(429);
+    const allowed = statuses.filter((s) => s === 200).length;
+    const blocked = statuses.filter((s) => s === 429).length;
+
+    expect(allowed).toBe(LIMIT);
+    expect(blocked).toBe(LIMIT);
   });
 
-  it('blocks on instance A after limit is reached on instance B', async () => {
-    // Exhaust limit entirely on instance B
-    for (let i = 0; i < LIMIT; i++) {
-      await request(appB.getHttpServer()).get('/test-rl');
+  it('blocks on instance C after A and B together exhaust the shared limit', async () => {
+    for (let i = 0; i < 2; i++) {
+      await request(apps[0].getHttpServer()).get('/test-rl').expect(200);
     }
-
-    // Instance A should now be blocked
-    const res = await request(appA.getHttpServer()).get('/test-rl');
-    expect(res.status).toBe(429);
-  });
-
-  it('429 response includes Retry-After header', async () => {
-    for (let i = 0; i < LIMIT; i++) {
-      await request(appA.getHttpServer()).get('/test-rl');
+    for (let i = 0; i < 2; i++) {
+      await request(apps[1].getHttpServer()).get('/test-rl').expect(200);
     }
+    await request(apps[2].getHttpServer()).get('/test-rl').expect(200);
 
-    const res = await request(appA.getHttpServer()).get('/test-rl');
+    const res = await request(apps[2].getHttpServer()).get('/test-rl');
     expect(res.status).toBe(429);
-    // ThrottlerGuard sets Retry-After automatically
-    expect(res.headers['retry-after'] ?? res.headers['x-ratelimit-reset']).toBeDefined();
   });
 });

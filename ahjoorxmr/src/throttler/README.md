@@ -2,6 +2,22 @@
 
 This module implements comprehensive rate limiting and API protection using `@nestjs/throttler` with Redis storage for distributed systems.
 
+## Counter-path audit (Issue 3)
+
+| Path | Store | Atomic? | Fail mode |
+|------|--------|---------|-----------|
+| Request throttle (`RedisThrottlerStorageService.increment`) | Redis Lua (`throttle:sw:*` / `throttle:fw:*`) | Yes | **Fail-closed** → HTTP 503 (never silent allow) |
+| Nest `isBlocked` contract | Same | Enforced (`totalHits > limit`) | N/A |
+| Violation counters (`TrustedIpService.incrementViolations`) | Redis Lua (`violations:*`) | Yes (INCR + EXPIRE-if-new) | Errors propagate |
+| IP block list | Redis (`blocked_ip:*`) | SETEX | Fail-closed in guard → 503 |
+| In-memory fallback | **None in production** | — | — |
+
+**Composition:** When `X-Api-Key` is present, the default throttler evaluates **both** the IP/user tracker and an `apikey:{sha256}` tracker. Request is rejected if **either** bucket is blocked (AND / strictest), not if only the looser one is exhausted.
+
+**Alerting:** Log line `rate_limit_redis_unavailable` — wire pager/alert on that string when Redis is unhealthy.
+
+**Env (API-key bucket):** `API_KEY_THROTTLE_LIMIT`, `API_KEY_THROTTLE_TTL` (default to `THROTTLE_LIMIT` / `THROTTLE_TTL`).
+
 ## Features
 
 - ✅ **Global rate limiting** across all endpoints

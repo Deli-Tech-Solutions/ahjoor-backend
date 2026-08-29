@@ -1,9 +1,16 @@
 import { ThrottlerModuleOptions } from '@nestjs/throttler';
 
 /**
- * Throttler configuration with multiple named throttlers
- * for different rate limiting strategies
+ * Named throttlers registered with Nest.
+ *
+ * Nest applies EVERY named throttler on every request unless skipped.
+ * Only `default` (and optional burst `short`) should be globally restrictive.
+ * Other names exist so `@Throttle({ auth: { … } })` etc. can tighten a route;
+ * their baseline limits are intentionally very high so they do not act as a
+ * second global ceiling (AND with default already enforces the product limit).
  */
+const NAMED_OVERRIDE_CEILING = 1_000_000;
+
 export const throttlerConfig: ThrottlerModuleOptions = {
   throttlers: [
     {
@@ -12,42 +19,34 @@ export const throttlerConfig: ThrottlerModuleOptions = {
       limit: parseInt(process.env.THROTTLE_LIMIT || '100', 10),
     },
     {
-      name: 'authenticated',
-      ttl: parseInt(process.env.THROTTLE_TTL_AUTHENTICATED || '60000', 10),
-      limit: parseInt(process.env.THROTTLE_LIMIT_AUTHENTICATED || '200', 10),
-    },
-    {
-      // Stricter named throttler for auth endpoints (#182)
-      name: 'auth',
-      ttl: parseInt(process.env.AUTH_LOGIN_TTL || '60000', 10),
-      limit: parseInt(process.env.AUTH_LOGIN_LIMIT || '10', 10),
-    },
-    {
       name: 'short',
       ttl: 1000,
-      limit: 10,
+      limit: parseInt(process.env.THROTTLE_SHORT_LIMIT || '10', 10),
+    },
+    {
+      name: 'authenticated',
+      ttl: parseInt(process.env.THROTTLE_TTL_AUTHENTICATED || '60000', 10),
+      limit: NAMED_OVERRIDE_CEILING,
+    },
+    {
+      name: 'auth',
+      ttl: parseInt(process.env.AUTH_LOGIN_TTL || '60000', 10),
+      limit: NAMED_OVERRIDE_CEILING,
     },
     {
       name: 'strict',
       ttl: 60000,
-      limit: 5,
+      limit: NAMED_OVERRIDE_CEILING,
     },
     {
       name: 'public',
       ttl: 60000,
-      limit: 500,
+      limit: NAMED_OVERRIDE_CEILING,
     },
   ],
-  // Error message customization
   errorMessage: 'Too Many Requests',
-
-  // Skip successful requests in counting (optional)
   skipSuccessfulRequests: false,
-
-  // Skip failed requests in counting (optional)
   skipFailedRequests: false,
-
-  // Ignore user agents (bots, health checks, etc.)
   ignoreUserAgents: [
     /googlebot/i,
     /bingbot/i,
@@ -55,35 +54,40 @@ export const throttlerConfig: ThrottlerModuleOptions = {
     /twitterbot/i,
     /facebookexternalhit/i,
     /linkedinbot/i,
-    /kube-probe/i, // Kubernetes health checks
+    /kube-probe/i,
     /pingdom/i,
     /uptimerobot/i,
   ],
 };
 
 /**
- * Get throttler config for specific environment
+ * Optional dedicated API-key bucket (AND-composed with IP/user tracker).
+ * Defaults match the default throttler unless overridden.
  */
+export function getApiKeyThrottleLimits(): { limit: number; ttl: number } {
+  return {
+    limit: parseInt(
+      process.env.API_KEY_THROTTLE_LIMIT || process.env.THROTTLE_LIMIT || '100',
+      10,
+    ),
+    ttl: parseInt(
+      process.env.API_KEY_THROTTLE_TTL || process.env.THROTTLE_TTL || '60000',
+      10,
+    ),
+  };
+}
+
 export function getThrottlerConfig(): ThrottlerModuleOptions {
   const env = process.env.NODE_ENV || 'development';
 
-  // More lenient in development
   if (env === 'development') {
     return {
       ...throttlerConfig,
-      throttlers: throttlerConfig.throttlers.map((t) => ({
-        ...t,
-        limit: t.limit * 2, // Double limits in development
-      })),
-    };
-  }
-
-  // Stricter in production
-  if (env === 'production') {
-    return {
-      ...throttlerConfig,
-      skipFailedRequests: false, // Count all requests in production
-      skipSuccessfulRequests: false,
+      throttlers: throttlerConfig.throttlers.map((t) =>
+        t.name === 'default' || t.name === 'short'
+          ? { ...t, limit: t.limit * 2 }
+          : t,
+      ),
     };
   }
 

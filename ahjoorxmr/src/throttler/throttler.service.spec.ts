@@ -1,86 +1,83 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { RedisThrottlerStorageService } from './redis-throttler-storage.service';
-import { getRedisToken } from '@nestjs-modules/ioredis';
+import { RedisService } from '../common/redis/redis.service';
 
 describe('RedisThrottlerStorageService', () => {
   let service: RedisThrottlerStorageService;
-  let redisMock: any;
+  let redisMock: {
+    eval: jest.Mock;
+    pttl: jest.Mock;
+  };
 
   beforeEach(async () => {
+    process.env.THROTTLE_ALGORITHM = 'fixed_window';
     redisMock = {
-      multi: jest.fn().mockReturnThis(),
-      incr: jest.fn().mockReturnThis(),
-      pexpire: jest.fn().mockReturnThis(),
-      pttl: jest.fn().mockReturnThis(),
-      exec: jest.fn().mockResolvedValue([
-        [null, 1], // incr result
-        [null, 'OK'], // pexpire result
-        [null, 60000], // pttl result
-      ]),
+      eval: jest.fn(),
+      pttl: jest.fn().mockResolvedValue(-2),
     };
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         RedisThrottlerStorageService,
         {
-          provide: getRedisToken('default'),
-          useValue: redisMock,
+          provide: RedisService,
+          useValue: { getClient: () => redisMock },
         },
       ],
     }).compile();
 
-    service = module.get<RedisThrottlerStorageService>(
-      RedisThrottlerStorageService,
-    );
+    service = module.get(RedisThrottlerStorageService);
+  });
+
+  afterEach(() => {
+    delete process.env.THROTTLE_ALGORITHM;
+    jest.clearAllMocks();
   });
 
   it('should be defined', () => {
     expect(service).toBeDefined();
   });
 
-  describe('increment', () => {
-    it('should increment counter and return correct values', async () => {
-      const key = 'test-key';
-      const ttl = 60000;
+  describe('increment (Nest v6 contract)', () => {
+    it('returns isBlocked=false when under limit', async () => {
+      redisMock.eval.mockResolvedValue([3, 60000]);
 
-      const result = await service.increment(key, ttl);
+      const result = await service.increment('k', 60000, 10, 60000, 'default');
 
-      expect(result).toEqual({
-        totalHits: 1,
-        timeToExpire: 60000,
-      });
-
-      expect(redisMock.multi).toHaveBeenCalled();
-      expect(redisMock.exec).toHaveBeenCalled();
+      expect(result.isBlocked).toBe(false);
+      expect(result.totalHits).toBe(3);
+      expect(result.timeToExpire).toBe(60);
+      expect(redisMock.eval).toHaveBeenCalled();
     });
 
-    it('should handle multiple increments', async () => {
-      redisMock.exec.mockResolvedValue([
-        [null, 5], // incr result (5th request)
-        [null, 'OK'], // pexpire result
-        [null, 45000], // pttl result (45 seconds remaining)
-      ]);
+    it('returns isBlocked=true when totalHits exceeds limit', async () => {
+      redisMock.eval
+        .mockResolvedValueOnce([11, 45000]) // fixed window
+        .mockResolvedValueOnce(45000); // block lua
 
-      const key = 'test-key';
-      const ttl = 60000;
+      const result = await service.increment('k', 60000, 10, 60000, 'default');
 
-      const result = await service.increment(key, ttl);
-
-      expect(result).toEqual({
-        totalHits: 5,
-        timeToExpire: 45000,
-      });
+      expect(result.isBlocked).toBe(true);
+      expect(result.totalHits).toBe(11);
+      expect(result.timeToBlockExpire).toBeGreaterThan(0);
     });
 
-    it('should throw error if Redis transaction fails', async () => {
-      redisMock.exec.mockResolvedValue(null);
+    it('fail-closes with 503 when Redis throws', async () => {
+      redisMock.pttl.mockRejectedValue(new Error('ECONNREFUSED'));
 
-      const key = 'test-key';
-      const ttl = 60000;
+      await expect(
+        service.increment('k', 60000, 10, 60000, 'default'),
+      ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
 
-      await expect(service.increment(key, ttl)).rejects.toThrow(
-        'Redis transaction failed',
-      );
+    it('respects an existing block key without incrementing further', async () => {
+      redisMock.pttl.mockResolvedValue(30000);
+
+      const result = await service.increment('k', 60000, 10, 60000, 'default');
+
+      expect(result.isBlocked).toBe(true);
+      expect(redisMock.eval).not.toHaveBeenCalled();
     });
   });
 });
