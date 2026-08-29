@@ -1,5 +1,6 @@
 export interface WebhookPayload {
   event: string;
+  event_id?: string;
   timestamp: string;
   data: any;
 }

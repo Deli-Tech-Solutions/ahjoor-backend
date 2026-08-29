@@ -4,7 +4,12 @@ import { Repository } from 'typeorm';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 
-import { TrustScoreService, computeTrustScore, TrustScoreComponents } from './trust-score.service';
+import {
+  TrustScoreService,
+  computeTrustScore,
+  TrustScoreComponents,
+  detectRepeatedCohort,
+} from './trust-score.service';
 import { MemberTrustScore } from './entities/member-trust-score.entity';
 import { Contribution, ContributionStatus } from '../contributions/entities/contribution.entity';
 import { Penalty, PenaltyStatus } from '../penalties/entities/penalty.entity';
@@ -120,6 +125,33 @@ describe('computeTrustScore (formula)', () => {
     const score = computeTrustScore(c);
     expect(score).toBeGreaterThanOrEqual(TRUST_SCORE_FORMULA.SCORE_MIN);
     expect(score).toBeLessThanOrEqual(TRUST_SCORE_FORMULA.SCORE_MAX);
+  });
+});
+
+describe('detectRepeatedCohort', () => {
+  it('flags sockpuppet group cycling with high confidence', () => {
+    const memberships = ['g1', 'g2', 'g3', 'g4'].flatMap((groupId) => [
+      { userId: 'target', groupId },
+      { userId: 'sockpuppet-a', groupId },
+      { userId: 'sockpuppet-b', groupId },
+    ]);
+
+    expect(detectRepeatedCohort('target', memberships)).toEqual({
+      confidence: 1,
+      flagged: true,
+    });
+  });
+
+  it('does not flag a legitimate high-activity user with diverse groups', () => {
+    const memberships = ['g1', 'g2', 'g3', 'g4', 'g5'].flatMap((groupId, index) => [
+      { userId: 'organizer', groupId },
+      { userId: `member-${index}`, groupId },
+    ]);
+
+    expect(detectRepeatedCohort('organizer', memberships)).toEqual({
+      confidence: 0.2,
+      flagged: false,
+    });
   });
 });
 

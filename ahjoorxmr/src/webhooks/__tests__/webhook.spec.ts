@@ -93,9 +93,43 @@ describe('WebhookService – delivery recording', () => {
 
     expect(queue.add).toHaveBeenCalledWith(
       'deliver-webhook',
-      expect.any(Object),
+      expect.objectContaining({ payload: expect.objectContaining({ event_id: expect.any(String) }) }),
       expect.objectContaining({ attempts: 5 }),
     );
+  });
+
+  it('uses the same event id when the same logical event is dispatched again', async () => {
+    webhookRepo.find.mockResolvedValue([
+      { id: 'wh-1', url: 'https://example.com', secret: 'sec', eventTypes: ['CONTRIBUTION_CONFIRMED'], isActive: true },
+    ]);
+    queue.add.mockResolvedValue({});
+
+    await service.dispatchEvent('CONTRIBUTION_CONFIRMED' as any, { contributionId: 'c-1' });
+    await service.dispatchEvent('CONTRIBUTION_CONFIRMED' as any, { contributionId: 'c-1' });
+
+    const firstJob = queue.add.mock.calls[0][1] as any;
+    const secondJob = queue.add.mock.calls[1][1] as any;
+    expect(firstJob.payload.event_id).toBe(secondJob.payload.event_id);
+  });
+
+  it('skips a duplicate event after a successful delivery', async () => {
+    const payload = {
+      event: 'CONTRIBUTION_CONFIRMED',
+      event_id: 'event-1',
+      timestamp: '2026-08-25T00:00:00.000Z',
+      data: { contributionId: 'c-1' },
+    };
+    deliveryRepo.findOne.mockResolvedValue({
+      eventId: 'event-1',
+      status: WebhookDeliveryStatus.SUCCESS,
+      responseCode: 200,
+      responseBody: '{"received":true}',
+    } as WebhookDelivery);
+
+    const result = await service.deliverWebhook('https://example.com', 'sec', payload, 'wh-1');
+
+    expect(result).toMatchObject({ statusCode: 200, deliveryTime: 0 });
+    expect(deliveryRepo.save).not.toHaveBeenCalled();
   });
 
   it('getDeliveries returns last 50 for owner', async () => {

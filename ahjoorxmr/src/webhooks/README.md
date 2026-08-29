@@ -177,6 +177,20 @@ def handle_webhook():
 
 ## Retry Behavior
 
+### Delivery Guarantees and Deduplication
+
+Each payload includes an `event_id` that identifies the logical event. The ID
+is stable across delivery attempts and is derived from the event type and event
+data, or can be supplied by the producer when replaying a known event. The
+`webhook_deliveries` table enforces one logical delivery per webhook and event.
+
+Webhook delivery is **at-least-once**. A successful delivery recorded by
+Ahjoor is not sent again when the same event is enqueued. A network timeout
+after a subscriber has processed a request can still cause a retry, so
+integrators must deduplicate using `event_id` and return a 2xx response for
+already-processed events. Retries reuse the same `event_id` and signature
+payload; `attemptNumber` identifies the attempt recorded internally.
+
 Webhook deliveries are automatically retried on failure with exponential backoff:
 
 1. **Attempt 1**: Immediate delivery

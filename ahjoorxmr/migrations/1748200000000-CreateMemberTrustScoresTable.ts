@@ -17,6 +17,8 @@ export class CreateMemberTrustScoresTable1748200000000
         "id"                          uuid              NOT NULL DEFAULT uuid_generate_v4(),
         "userId"                      uuid              NOT NULL,
         "score"                       numeric(5,2)      NOT NULL DEFAULT 0,
+        "antiGamingConfidence"        numeric(5,4)      NOT NULL DEFAULT 0,
+        "antiGamingFlagged"           boolean           NOT NULL DEFAULT false,
         "totalGroupsParticipated"     integer           NOT NULL DEFAULT 0,
         "onTimeContributions"         integer           NOT NULL DEFAULT 0,
         "lateContributions"           integer           NOT NULL DEFAULT 0,

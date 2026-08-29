@@ -22,6 +22,50 @@ export interface TrustScoreComponents {
   totalGroupsParticipated: number;
 }
 
+export interface AntiGamingResult {
+  confidence: number;
+  flagged: boolean;
+}
+
+const ANTI_GAMING_MIN_GROUPS = 3;
+const ANTI_GAMING_MIN_REPEATED_GROUPS = 3;
+const ANTI_GAMING_FLAG_THRESHOLD = 0.75;
+
+/**
+ * Detects a repeated small cohort across groups. A diverse membership graph
+ * produces a low confidence score, while cycling the same co-members produces
+ * a review signal. This is advisory and must not alter the trust score.
+ */
+export function detectRepeatedCohort(
+  userId: string,
+  memberships: Array<{ userId: string; groupId: string }>,
+): AntiGamingResult {
+  const userGroups = new Set(
+    memberships.filter((m) => m.userId === userId).map((m) => m.groupId),
+  );
+  if (userGroups.size < ANTI_GAMING_MIN_GROUPS) {
+    return { confidence: 0, flagged: false };
+  }
+
+  const sharedGroupsByUser = new Map<string, number>();
+  for (const membership of memberships) {
+    if (membership.userId === userId || !userGroups.has(membership.groupId)) continue;
+    sharedGroupsByUser.set(
+      membership.userId,
+      (sharedGroupsByUser.get(membership.userId) ?? 0) + 1,
+    );
+  }
+
+  const maxRepeatedGroups = Math.max(0, ...sharedGroupsByUser.values());
+  const confidence = Math.min(1, maxRepeatedGroups / userGroups.size);
+  return {
+    confidence: Number(confidence.toFixed(4)),
+    flagged:
+      maxRepeatedGroups >= ANTI_GAMING_MIN_REPEATED_GROUPS &&
+      confidence >= ANTI_GAMING_FLAG_THRESHOLD,
+  };
+}
+
 /**
  * Computes the deterministic trust score from raw components.
  * Formula (all constants defined in trust-score.constants.ts):
@@ -191,8 +235,16 @@ export class TrustScoreService {
       select: ['userId', 'groupId'],
     });
 
-    // Fetch completed groups to determine successful completions
     const groupIds = [...new Set(memberships.map((m) => m.groupId))];
+    const allGroupMemberships =
+      groupIds.length > 0
+        ? await this.membershipRepository.find({
+            where: { groupId: In(groupIds) },
+            select: ['userId', 'groupId'],
+          })
+        : memberships;
+
+    // Fetch completed groups to determine successful completions
     const completedGroups =
       groupIds.length > 0
         ? await this.groupRepository.find({
@@ -267,11 +319,14 @@ export class TrustScoreService {
     for (const userId of userIds) {
       const comp = componentsByUser.get(userId)!;
       const score = computeTrustScore(comp);
+      const antiGaming = detectRepeatedCohort(userId, allGroupMemberships);
 
       await this.trustScoreRepository.upsert(
         {
           userId,
           score,
+          antiGamingConfidence: antiGaming.confidence,
+          antiGamingFlagged: antiGaming.flagged,
           totalGroupsParticipated: comp.totalGroupsParticipated,
           onTimeContributions: comp.onTimeContributions,
           lateContributions: comp.lateContributions,
@@ -291,6 +346,13 @@ export class TrustScoreService {
         calculatedAt: now.toISOString(),
       });
     }
+  }
+
+  async listFlaggedScores(): Promise<MemberTrustScore[]> {
+    return this.trustScoreRepository.find({
+      where: { antiGamingFlagged: true },
+      order: { antiGamingConfidence: 'DESC', updatedAt: 'DESC' },
+    });
   }
 
   /**
