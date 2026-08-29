@@ -26,17 +26,25 @@ export class PaymentsController {
   }
 
   @Patch(':id/pause')
-  async pause(@Param('id') id: string) {
-    return this.paymentsService.pausePlan(id);
+  async pause(@Param('id') id: string, @Body('currentLedger') currentLedger: number) {
+    return this.paymentsService.pausePlan(id, currentLedger);
   }
 
   @Patch(':id/resume')
-  async resume(@Param('id') id: string) {
-    return this.paymentsService.resumePlan(id);
+  async resume(@Param('id') id: string, @Body('currentLedger') currentLedger: number) {
+    return this.paymentsService.resumePlan(id, currentLedger);
   }
 
   @Get(':id')
   async getPlan(@Param('id') id: string) {
     return this.paymentsService.getPlan(id);
+  }
+
+  @Get(':id/penalty-accrual')
+  async getPenaltyAccrual(
+    @Param('id') id: string,
+    @Query('currentLedger') currentLedger: string,
+  ) {
+    return this.paymentsService.getPenaltyAccrualState(id, Number(currentLedger));
   }
 }

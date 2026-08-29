@@ -1,4 +1,11 @@
-import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  CreateDateColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 
 export enum InstallmentPlanStatus {
@@ -34,6 +41,10 @@ export class InstallmentPaymentPlan {
   @Column('int')
   currentInstallment: number;
 
+  /**
+   * Next installment due ledger. Shifted forward by paused duration on each
+   * resume so the penalty accrual clock resumes from where it left off.
+   */
   @Column('int')
   nextDueLedger: number;
 
@@ -48,6 +59,26 @@ export class InstallmentPaymentPlan {
 
   @Column({ default: false })
   paused: boolean;
+
+  /** Ledger at which the current pause began; null when not paused. */
+  @Column({ type: 'int', nullable: true })
+  pausedAtLedger: number | null;
+
+  /** Wall-clock start of the current pause; null when not paused. */
+  @Column({ type: 'timestamptz', nullable: true })
+  pausedAt: Date | null;
+
+  /** Cumulative ledgers spent paused across all pause/resume cycles. */
+  @Column({ type: 'int', default: 0 })
+  totalPausedLedgers: number;
+
+  /** Number of times this plan has been paused (lifetime). */
+  @Column({ type: 'int', default: 0 })
+  pauseCount: number;
+
+  /** Ledger at which the plan was last resumed; used for pause cooldown. */
+  @Column({ type: 'int', nullable: true })
+  lastResumedAtLedger: number | null;
 
   @CreateDateColumn()
   createdAt: Date;
