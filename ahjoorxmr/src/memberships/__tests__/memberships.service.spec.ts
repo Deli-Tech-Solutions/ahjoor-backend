@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { MembershipsService } from '../memberships.service';
 import { Membership } from '../entities/membership.entity';
 import { Group } from '../../groups/entities/group.entity';
@@ -13,6 +13,8 @@ import {
 } from '@nestjs/common';
 import { NotificationsService } from '../../notification/notifications.service';
 import { GroupStatus } from '../../groups/entities/group-status.enum';
+import { WaitlistService } from '../../waitlist/waitlist.service';
+import { MemberTrustScore } from '../../trust-score/entities/member-trust-score.entity';
 
 /**
  * Mock factory for creating Membership entities with default values.
@@ -97,6 +99,14 @@ describe('MembershipsService', () => {
   let groupRepository: MockRepository<Group>;
   let logger: MockLogger;
   let notificationsService: Partial<NotificationsService>;
+  let txManager: {
+    createQueryBuilder: jest.Mock;
+    count: jest.Mock;
+    findOne: jest.Mock;
+    create: jest.Mock;
+    save: jest.Mock;
+  };
+  let dataSource: { transaction: jest.Mock };
 
   beforeEach(async () => {
     // Create mock instances
@@ -105,6 +115,29 @@ describe('MembershipsService', () => {
     logger = createMockLogger();
     notificationsService = {
       notify: jest.fn().mockResolvedValue({}),
+    };
+
+    txManager = {
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getOne: jest
+          .fn()
+          .mockResolvedValue(
+            createMockGroup({ status: GroupStatus.PENDING, maxMembers: 5 }),
+          ),
+        getRawOne: jest.fn().mockResolvedValue({ maxOrder: 0 }),
+      }),
+      count: jest.fn().mockResolvedValue(0),
+      findOne: jest.fn().mockResolvedValue(null),
+      create: jest.fn().mockImplementation((_e, data) => data),
+      save: jest
+        .fn()
+        .mockImplementation((_e, data) => Promise.resolve(createMockMembership(data))),
+    };
+    dataSource = {
+      transaction: jest.fn(async (cb) => cb(txManager)),
     };
 
     // Create testing module with mocked dependencies
@@ -126,6 +159,18 @@ describe('MembershipsService', () => {
         {
           provide: NotificationsService,
           useValue: notificationsService,
+        },
+        {
+          provide: WaitlistService,
+          useValue: { admitFromWaitlist: jest.fn().mockResolvedValue([]) },
+        },
+        {
+          provide: getRepositoryToken(MemberTrustScore),
+          useValue: createMockRepository(),
+        },
+        {
+          provide: DataSource,
+          useValue: dataSource,
         },
       ],
     }).compile();
@@ -396,46 +441,59 @@ describe('MembershipsService', () => {
       walletAddress: '0xabc',
     };
 
+    const stubGroupLock = (group: Group, memberCount: number) => {
+      const qb = {
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getOne: jest.fn().mockResolvedValue(group),
+        getRawOne: jest.fn().mockResolvedValue({ maxOrder: memberCount - 1 }),
+      };
+      txManager.createQueryBuilder.mockReturnValue(qb);
+      txManager.count.mockResolvedValue(memberCount);
+      txManager.findOne.mockResolvedValue(null);
+      return qb;
+    };
+
     it('should be defined', () => {
       expect(service.addMember).toBeDefined();
     });
 
     it('should throw BadRequestException when group is at maxMembers cap', async () => {
-      const group = createMockGroup({ maxMembers: 3 });
-      groupRepository.findOne!.mockResolvedValue(group);
-      membershipRepository.count!.mockResolvedValue(3);
+      const group = createMockGroup({ maxMembers: 3, status: GroupStatus.PENDING });
+      stubGroupLock(group, 3);
 
-      await expect(service.addMember(groupId, dto)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(service.addMember(groupId, dto)).rejects.toThrow(BadRequestException);
       await expect(service.addMember(groupId, dto)).rejects.toThrow(
         'maximum member capacity of 3',
       );
     });
 
     it('should throw BadRequestException when group exceeds maxMembers cap', async () => {
-      const group = createMockGroup({ maxMembers: 3 });
-      groupRepository.findOne!.mockResolvedValue(group);
-      membershipRepository.count!.mockResolvedValue(4);
+      const group = createMockGroup({ maxMembers: 3, status: GroupStatus.PENDING });
+      stubGroupLock(group, 4);
 
-      await expect(service.addMember(groupId, dto)).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(service.addMember(groupId, dto)).rejects.toThrow(BadRequestException);
+    });
+
+    it('should lock the group row when checking capacity', async () => {
+      const group = createMockGroup({ maxMembers: 3, status: GroupStatus.PENDING });
+      const qb = stubGroupLock(group, 2);
+      const membership = createMockMembership();
+      txManager.create.mockReturnValue(membership);
+      txManager.save.mockResolvedValue(membership);
+
+      await service.addMember(groupId, dto);
+
+      expect(qb.setLock).toHaveBeenCalledWith('pessimistic_write');
     });
 
     it('should add member successfully when below maxMembers cap', async () => {
-      const group = createMockGroup({ maxMembers: 3 });
+      const group = createMockGroup({ maxMembers: 3, status: GroupStatus.PENDING });
+      stubGroupLock(group, 2);
       const membership = createMockMembership();
-      groupRepository.findOne!.mockResolvedValue(group);
-      membershipRepository.count!.mockResolvedValue(2);
-      membershipRepository.findOne!.mockResolvedValue(null);
-      membershipRepository.createQueryBuilder!.mockReturnValue({
-        select: jest.fn().mockReturnThis(),
-        where: jest.fn().mockReturnThis(),
-        getRawOne: jest.fn().mockResolvedValue({ maxOrder: null }),
-      });
-      membershipRepository.create!.mockReturnValue(membership);
-      membershipRepository.save!.mockResolvedValue(membership);
+      txManager.create.mockReturnValue(membership);
+      txManager.save.mockResolvedValue(membership);
 
       const result = await service.addMember(groupId, dto);
 
@@ -443,18 +501,11 @@ describe('MembershipsService', () => {
     });
 
     it('should add member successfully when exactly one below cap (boundary)', async () => {
-      const group = createMockGroup({ maxMembers: 5 });
+      const group = createMockGroup({ maxMembers: 5, status: GroupStatus.PENDING });
+      stubGroupLock(group, 4);
       const membership = createMockMembership();
-      groupRepository.findOne!.mockResolvedValue(group);
-      membershipRepository.count!.mockResolvedValue(4);
-      membershipRepository.findOne!.mockResolvedValue(null);
-      membershipRepository.createQueryBuilder!.mockReturnValue({
-        select: jest.fn().mockReturnThis(),
-        where: jest.fn().mockReturnThis(),
-        getRawOne: jest.fn().mockResolvedValue({ maxOrder: 3 }),
-      });
-      membershipRepository.create!.mockReturnValue(membership);
-      membershipRepository.save!.mockResolvedValue(membership);
+      txManager.create.mockReturnValue(membership);
+      txManager.save.mockResolvedValue(membership);
 
       const result = await service.addMember(groupId, dto);
 

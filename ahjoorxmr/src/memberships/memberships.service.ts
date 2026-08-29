@@ -6,7 +6,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, QueryFailedError, In } from 'typeorm';
+import { Repository, QueryFailedError, In, DataSource } from 'typeorm';
 import { Membership } from './entities/membership.entity';
 import { Group } from '../groups/entities/group.entity';
 import { WinstonLogger } from '../common/logger/winston.logger';
@@ -32,6 +32,7 @@ export class MembershipsService {
     private readonly groupRepository: Repository<Group>,
     @InjectRepository(MemberTrustScore)
     private readonly trustScoreRepository: Repository<MemberTrustScore>,
+    private readonly dataSource: DataSource,
     private readonly logger: WinstonLogger,
     private readonly notificationsService: NotificationsService,
     private readonly waitlistService: WaitlistService,
@@ -131,53 +132,69 @@ export class MembershipsService {
     );
 
     try {
-      // Validate group exists and is not active
-      const group = await this.validateGroupNotActive(groupId);
+      // Capacity check + insert under group row lock so this cannot race
+      // waitlist admission past maxMembers (classic TOCTOU).
+      const savedMembership = await this.dataSource.transaction(async (manager) => {
+        const group = await manager
+          .createQueryBuilder(Group, 'g')
+          .setLock('pessimistic_write')
+          .where('g.id = :groupId', { groupId })
+          .getOne();
 
-      // Enforce maxMembers cap
-      const memberCount = await this.membershipRepository.count({
-        where: { groupId },
+        if (!group) {
+          throw new NotFoundException('Group not found');
+        }
+        if (group.status === 'ACTIVE') {
+          throw new BadRequestException(
+            'Cannot modify memberships for an active group',
+          );
+        }
+
+        const memberCount = await manager.count(Membership, { where: { groupId } });
+        if (memberCount >= group.maxMembers) {
+          this.logger.warn(
+            `Group ${groupId} is at capacity (${memberCount}/${group.maxMembers})`,
+            'MembershipsService',
+          );
+          throw new BadRequestException(
+            `Group has reached its maximum member capacity of ${group.maxMembers}`,
+          );
+        }
+
+        const existingMembership = await manager.findOne(Membership, {
+          where: { groupId, userId },
+        });
+        if (existingMembership) {
+          throw new ConflictException('User is already a member of this group');
+        }
+
+        let payoutOrder: number | null = null;
+        if (
+          group.payoutOrderStrategy !== 'RANDOM' &&
+          group.payoutOrderStrategy !== 'ADMIN_DEFINED'
+        ) {
+          const result = await manager
+            .createQueryBuilder(Membership, 'membership')
+            .select('MAX(membership.payoutOrder)', 'maxOrder')
+            .where('membership.groupId = :groupId', { groupId })
+            .getRawOne();
+          const maxOrder = result?.maxOrder;
+          payoutOrder =
+            maxOrder !== null && maxOrder !== undefined ? Number(maxOrder) + 1 : 0;
+        }
+
+        const membership = manager.create(Membership, {
+          groupId,
+          userId,
+          walletAddress,
+          payoutOrder: payoutOrder as any,
+          status: MembershipStatus.ACTIVE,
+          hasReceivedPayout: false,
+          hasPaidCurrentRound: false,
+        });
+
+        return manager.save(Membership, membership);
       });
-
-      if (memberCount >= group.maxMembers) {
-        this.logger.warn(
-          `Group ${groupId} is at capacity (${memberCount}/${group.maxMembers})`,
-          'MembershipsService',
-        );
-        throw new BadRequestException(
-          `Group has reached its maximum member capacity of ${group.maxMembers}`,
-        );
-      }
-
-      // Check for duplicate membership
-      const existingMembership = await this.membershipRepository.findOne({
-        where: { groupId, userId },
-      });
-
-      if (existingMembership) {
-        this.logger.warn(
-          `User ${userId} is already a member of group ${groupId}`,
-          'MembershipsService',
-        );
-        throw new ConflictException('User is already a member of this group');
-      }
-
-      // Calculate next available payout order (null for RANDOM/ADMIN_DEFINED)
-      const payoutOrder = await this.getNextPayoutOrder(groupId);
-
-      // Create membership with default values
-      const membership = this.membershipRepository.create({
-        groupId,
-        userId,
-        walletAddress,
-        payoutOrder: payoutOrder as any, // Allow null for non-SEQUENTIAL strategies
-        status: MembershipStatus.ACTIVE,
-        hasReceivedPayout: false,
-        hasPaidCurrentRound: false,
-      });
-
-      // Save to database
-      const savedMembership = await this.membershipRepository.save(membership);
 
       this.logger.log(
         `Member ${userId} added to group ${groupId} with membership id ${savedMembership.id}`,
@@ -272,9 +289,9 @@ export class MembershipsService {
         'MembershipsService',
       );
 
-      // Admit next waitlisted user if one exists
+      // Fill free slots from waitlist (group-row lock prevents over-promotion)
       setImmediate(() =>
-        this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+        this.waitlistService.admitFromWaitlist(groupId).catch((err) =>
           this.logger.error(
             `Failed to admit from waitlist after removal in group ${groupId}: ${err.message}`,
             err.stack,
@@ -422,9 +439,9 @@ export class MembershipsService {
       // Delete membership from database
       await this.membershipRepository.remove(membership);
 
-      // Admit next waitlisted user if one exists
+      // Fill free slots from waitlist (group-row lock prevents over-promotion)
       setImmediate(() =>
-        this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+        this.waitlistService.admitFromWaitlist(groupId).catch((err) =>
           this.logger.error(
             `Failed to admit from waitlist after leave in group ${groupId}: ${err.message}`,
             err.stack,
@@ -654,9 +671,9 @@ export class MembershipsService {
       metadata: { groupId, reason, adminId: requestingUserId },
     });
 
-    // A suspended member frees a slot — admit next from waitlist
+    // A suspended member frees a slot — fill from waitlist under group lock
     setImmediate(() =>
-      this.waitlistService.admitNextFromWaitlist(groupId).catch((err) =>
+      this.waitlistService.admitFromWaitlist(groupId).catch((err) =>
         this.logger.error(
           `Failed to admit from waitlist after suspension in group ${groupId}: ${err.message}`,
           err.stack,

@@ -6,7 +6,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, EntityManager } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { GroupWaitlist, WaitlistStatus } from './entities/group-waitlist.entity';
 import { Group } from '../groups/entities/group.entity';
@@ -15,6 +15,12 @@ import { MembershipStatus } from '../memberships/entities/membership-status.enum
 import { NotificationsService } from '../notification/notifications.service';
 import { NotificationType } from '../notification/notification-type.enum';
 import { WinstonLogger } from '../common/logger/winston.logger';
+
+export interface AdmittedWaitlistUser {
+  userId: string;
+  waitlistEntryId: string;
+  groupName: string;
+}
 
 @Injectable()
 export class WaitlistService {
@@ -137,68 +143,139 @@ export class WaitlistService {
   }
 
   /**
-   * Admits the first WAITING user from the waitlist into the group atomically.
-   * Uses a pessimistic write lock to prevent double-admission under concurrency.
+   * Admits the next WAITING user (at most one). Prefer {@link admitFromWaitlist}
+   * when multiple slots may be free — it fills capacity under a group row lock.
    */
   async admitNextFromWaitlist(groupId: string): Promise<void> {
-    await this.dataSource.transaction(async (manager) => {
-      const next = await manager.findOne(GroupWaitlist, {
-        where: { groupId, status: WaitlistStatus.WAITING },
-        order: { position: 'ASC' },
-        lock: { mode: 'pessimistic_write' },
-      });
-      if (!next) return;
+    await this.admitFromWaitlist(groupId, 1);
+  }
 
-      const group = await manager.findOne(Group, { where: { id: groupId } });
-      if (!group) return;
+  /**
+   * Fills open group slots from the waitlist in FIFO order under a group-level
+   * `SELECT … FOR UPDATE` lock so concurrent leave/remove/suspend triggers
+   * cannot over-promote past `maxMembers`.
+   *
+   * @param maxToAdmit Optional cap on how many users to admit in this call.
+   *                   Defaults to all free slots.
+   * @returns userIds actually admitted (empty if none)
+   */
+  async admitFromWaitlist(
+    groupId: string,
+    maxToAdmit?: number,
+  ): Promise<string[]> {
+    const admitted = await this.dataSource.transaction(async (manager) =>
+      this.admitFromWaitlistInTransaction(manager, groupId, maxToAdmit),
+    );
 
-      const memberCount = await manager.count(Membership, { where: { groupId } });
-      if (memberCount >= group.maxMembers) return;
+    for (const entry of admitted) {
+      this.scheduleAdmissionNotification(entry, groupId);
+    }
 
-      const result = await manager
-        .createQueryBuilder(Membership, 'm')
-        .select('MAX(m.payoutOrder)', 'maxOrder')
-        .where('m.groupId = :groupId', { groupId })
-        .getRawOne();
-      const maxOrder = result?.maxOrder;
-      const payoutOrder = maxOrder !== null && maxOrder !== undefined ? maxOrder + 1 : 0;
+    return admitted.map((a) => a.userId);
+  }
 
+  /**
+   * Core admission path. Exposed for tests that inject a transactional manager.
+   */
+  async admitFromWaitlistInTransaction(
+    manager: EntityManager,
+    groupId: string,
+    maxToAdmit?: number,
+  ): Promise<AdmittedWaitlistUser[]> {
+    // Lock the group row first — this is the capacity owner. Concurrent admits
+    // and addMember (when similarly locked) serialize on this row.
+    const group = await manager
+      .createQueryBuilder(Group, 'g')
+      .setLock('pessimistic_write')
+      .where('g.id = :groupId', { groupId })
+      .getOne();
+    if (!group) return [];
+
+    const memberCount = await manager.count(Membership, { where: { groupId } });
+    const freeSlots = group.maxMembers - memberCount;
+    if (freeSlots <= 0) return [];
+
+    const limit =
+      maxToAdmit == null ? freeSlots : Math.min(freeSlots, Math.max(0, maxToAdmit));
+    if (limit === 0) return [];
+
+    const entries = await manager
+      .createQueryBuilder(GroupWaitlist, 'w')
+      .setLock('pessimistic_write')
+      .where('w.groupId = :groupId AND w.status = :status', {
+        groupId,
+        status: WaitlistStatus.WAITING,
+      })
+      .orderBy('w.position', 'ASC')
+      .take(limit)
+      .getMany();
+
+    if (entries.length === 0) return [];
+
+    const result = await manager
+      .createQueryBuilder(Membership, 'm')
+      .select('MAX(m.payoutOrder)', 'maxOrder')
+      .where('m.groupId = :groupId', { groupId })
+      .getRawOne();
+    let nextPayoutOrder =
+      result?.maxOrder !== null && result?.maxOrder !== undefined
+        ? Number(result.maxOrder) + 1
+        : 0;
+
+    const admitted: AdmittedWaitlistUser[] = [];
+
+    for (const entry of entries) {
       const membership = manager.create(Membership, {
         groupId,
-        userId: next.userId,
-        walletAddress: next.walletAddress,
-        payoutOrder,
+        userId: entry.userId,
+        walletAddress: entry.walletAddress,
+        payoutOrder: nextPayoutOrder++,
         status: MembershipStatus.ACTIVE,
         hasReceivedPayout: false,
         hasPaidCurrentRound: false,
       });
       await manager.save(Membership, membership);
 
-      next.status = WaitlistStatus.ADMITTED;
-      await manager.save(GroupWaitlist, next);
+      entry.status = WaitlistStatus.ADMITTED;
+      await manager.save(GroupWaitlist, entry);
+
+      admitted.push({
+        userId: entry.userId,
+        waitlistEntryId: entry.id,
+        groupName: group.name,
+      });
 
       this.logger.log(
-        `User ${next.userId} admitted from waitlist into group ${groupId}`,
+        `User ${entry.userId} admitted from waitlist into group ${groupId}`,
         'WaitlistService',
       );
+    }
 
-      setImmediate(() =>
-        this.notificationsService
-          .notify({
-            userId: next.userId,
-            type: NotificationType.WAITLIST_ADMITTED,
-            title: 'You have been admitted to the group',
-            body: `A spot opened up in "${group.name}" and you have been admitted.`,
-            metadata: { groupId, groupName: group.name },
-          })
-          .catch((err) =>
-            this.logger.error(
-              `Failed to send WAITLIST_ADMITTED notification: ${err.message}`,
-              err.stack,
-              'WaitlistService',
-            ),
+    return admitted;
+  }
+
+  private scheduleAdmissionNotification(
+    entry: AdmittedWaitlistUser,
+    groupId: string,
+  ): void {
+    const idempotencyKey = `waitlist_admitted:${groupId}:${entry.userId}:${entry.waitlistEntryId}`;
+    setImmediate(() =>
+      this.notificationsService
+        .notify({
+          userId: entry.userId,
+          type: NotificationType.WAITLIST_ADMITTED,
+          title: 'You have been admitted to the group',
+          body: `A spot opened up in "${entry.groupName}" and you have been admitted.`,
+          metadata: { groupId, groupName: entry.groupName },
+          idempotencyKey,
+        })
+        .catch((err) =>
+          this.logger.error(
+            `Failed to send WAITLIST_ADMITTED notification: ${err.message}`,
+            err.stack,
+            'WaitlistService',
           ),
-      );
-    });
+        ),
+    );
   }
 }
