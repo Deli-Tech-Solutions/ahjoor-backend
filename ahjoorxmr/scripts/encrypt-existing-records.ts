@@ -8,6 +8,10 @@
  * Required env vars:
  *   DB_FIELD_ENCRYPTION_KEY  — 64-char hex (32 bytes)
  *   DB_FIELD_ENCRYPTION_KEY_PREVIOUS — optional, for rows already encrypted with old key
+ *
+ * To ROTATE the encryption key online (zero downtime, resumable, batched,
+ * throttled) use scripts/rotate-encryption-keys.ts instead — see
+ * docs/runbooks/encryption-key-rotation.md.
  */
 
 import 'reflect-metadata';
