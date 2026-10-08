@@ -167,7 +167,35 @@ export class PayoutService implements OnApplicationBootstrap {
       assetIssuer: payoutAssetIssuer,
       requestedAmount: payoutAmount,
     });
-    await this.payoutTransactionRepository.save(payoutTransaction);
+    try {
+      await this.payoutTransactionRepository.save(payoutTransaction);
+    } catch (err: any) {
+      if (
+        err?.code === '23505' ||
+        err?.message?.includes('duplicate key') ||
+        err?.message?.includes('unique constraint') ||
+        err?.message?.includes('payoutOrderId')
+      ) {
+        this.logger.warn(
+          'Concurrent payout collision for ' + payoutOrderId + '; reading existing transaction state',
+        );
+        const existing = await this.payoutTransactionRepository.findOne({
+          where: { payoutOrderId },
+        });
+        if (existing) {
+          if (existing.status === PayoutTransactionStatus.SUBMITTED) {
+            await this.queueService.addPayoutReconciliation({
+              payoutTransactionId: existing.id,
+            });
+          }
+          return (
+            existing.txHash ??
+            ('payout_' + existing.status.toLowerCase() + '_' + existing.id)
+          );
+        }
+      }
+      throw err;
+    }
 
     let txHash: string;
     try {

@@ -4,9 +4,9 @@
   "description": "Email template system with BullMQ and Handlebars",
   "main": "dist/main.js",
   "scripts": {
-    "start": "node dist/main.js",
-    "dev": "NODE_ENV=development nest start --watch",
-    "build": "nest build",
+    "start": "node init && node dist/main.js",
+    "dev": "node init && NODE_ENV=development nest start --watch",
+    "build": "node init && nest build",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage"
